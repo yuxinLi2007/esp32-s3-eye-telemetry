@@ -13,6 +13,7 @@
 #include <HTTPClient.h>
 #include <Preferences.h>
 #include <WiFi.h>
+#include <esp_sntp.h>
 #include <time.h>
 
 #include "config.h"
@@ -88,26 +89,38 @@ static void wifi_ensure() {
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 }
 
+// 只有真的收到 SNTP 应答，lwIP 才会调用这个回调——这正是"同步年龄"该有的口径。
+//
+// 不能用"configTime() 之后读一次 time() 是否合理"来判断同步成功：系统时钟本来就
+// 从上一次同步起一直在走，那个值必然合理，于是每次重同步都会把年龄清零，
+// 把"没有收到任何应答"说成"刚刚同步过"。即"新鲜"这个结论本身不可信。
+static void on_sntp_sync(struct timeval *tv) {
+  if (tv->tv_sec < (time_t)NTP_VALID_EPOCH) return; // 明显不合理的值不采信
+  g_ntp_sync_uptime_ms = millis();
+  g_ntp_sync_epoch_s = (uint32_t)tv->tv_sec;
+  g_ntp_synced = true;
+  Serial.printf("[ntp] 收到应答 epoch=%lu\n", (unsigned long)tv->tv_sec);
+}
+
 static void ntp_ensure() {
-  bool need = false;
-  if (!g_ntp_synced) {
-    need = true;
-  } else if (millis() - g_ntp_sync_uptime_ms > NTP_RESYNC_MS) {
-    // 主动作废旧同步，重新走一遍同步流程，让上报的"同步年龄"保持真实
-    g_ntp_synced = false;
-    need = true;
+  static bool cb_ready = false;
+  if (!cb_ready) {
+    cb_ready = true;
+    sntp_set_time_sync_notification_cb(on_sntp_sync);
   }
+
+  bool need = !g_ntp_synced || (millis() - g_ntp_sync_uptime_ms > NTP_RESYNC_MS);
   if (!need) return;
-  if (millis() - g_last_ntp_request < 10000 && g_last_ntp_request != 0) return;
+  if (g_last_ntp_request != 0 && millis() - g_last_ntp_request < 10000) return;
   g_last_ntp_request = millis();
 
-  configTime(8 * 3600, 0, "ntp.aliyun.com", "ntp.tencent.com", "pool.ntp.org");
-  time_t now = time(nullptr);
-  if (now > (time_t)NTP_VALID_EPOCH) {
-    g_ntp_synced = true;
-    g_ntp_sync_uptime_ms = millis();
-    g_ntp_sync_epoch_s = (uint32_t)now;
-    Serial.printf("[ntp] 已同步 epoch=%lu\n", (unsigned long)now);
+  if (!g_ntp_synced) {
+    Serial.println("[ntp] 首次同步 ...");
+    configTime(8 * 3600, 0, "ntp.aliyun.com", "ntp.tencent.com", "pool.ntp.org");
+  } else {
+    // 已有过一次同步：不清空状态、不重置年龄，只强制重新查询。
+    // 查询成功时由回调把年龄清零；一直失败就让它如实增长直到越过阈值。
+    sntp_restart();
   }
 }
 

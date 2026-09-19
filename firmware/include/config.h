@@ -33,4 +33,9 @@
 #define MAX_BATCH           100   // 单次上传样本上限
 
 #define FW_VERSION          "0.1.0"
-#define NTP_RESYNC_MS       (30UL * 60UL * 1000UL)
+
+// 必须明显小于服务端 db.NTP_FRESH_THRESHOLD_S(300 秒)。
+// 原值 30 分钟远大于 300 秒，实测导致同步年龄一路上涨、3000 个样本全部被判成
+// ntp_stale——可信度标签变成常量，等于没有信息。取 4 分钟留出重试与回调延迟的余量。
+// 若同步真的失败，年龄会如实继续增长并越过阈值，那时报"陈旧/过期"才是对的。
+#define NTP_RESYNC_MS       (4UL * 60UL * 1000UL)

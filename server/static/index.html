@@ -248,11 +248,12 @@ function drawChart(canvas, tip, series, opts) {
   if (x1 <= x0) x1 = x0 + 1000;
 
   const vs = all.map(p => p[opts.field]);
+  // 把参考值并进量程，保证 1g 那条线一定在视野里；
+  // 但不用它当地板——否则真实波动被压成一条平线，等于没画。
+  if (opts.include) vs.push(...opts.include);
   let lo = Math.min(...vs), hi = Math.max(...vs);
-  const pad = (hi - lo) * 0.15 || 0.1;
+  const pad = (hi - lo) * 0.15 || 0.05;
   lo -= pad; hi += pad;
-  if (opts.forceMin !== undefined) lo = Math.min(lo, opts.forceMin);
-  if (opts.forceMax !== undefined) hi = Math.max(hi, opts.forceMax);
 
   const X = t => L + (t - x0) / (x1 - x0) * pw;
   const Y = v => T + (hi - v) / (hi - lo) * ph;
@@ -487,7 +488,7 @@ async function tick() {
            + '  ' + (p.raw.source_ip || '—');
     };
     drawChart($('c_acc'), $('tip_acc'), series, {
-      field:'mag', color:COL.ok, decimals:3, refLine:1.0, forceMin:0.5,
+      field:'mag', color:COL.ok, decimals:3, refLine:1.0, include:[1.0],
       tip: tipFor('mag', '|a|', 'g', 3),
     });
     drawChart($('c_spl'), $('tip_spl'), series, {
@@ -495,7 +496,9 @@ async function tick() {
       tip: tipFor('spl', 'SPL', 'dB', 1),
     });
 
-    // 报警优先级：先报"根本收不到"，再报"收到了但有缺失"
+    // 报警优先级从"根本收不到"到"收到了但有瑕疵"。
+    // 时间戳可信度必须在这条链里，不能另起一行附注——否则会出现
+    // 主行说"时间戳可信"、附注说"存在非新鲜时间戳"这种自相矛盾的提示。
     const last = st.last_batch;
     const missingN = series.bands.reduce((n, b) => {
       const m = /^丢样 (\d+)/.exec(b.reason);
@@ -503,10 +506,14 @@ async function tick() {
     }, 0);
     const recentDrop = last ? last.dropped_since_last : 0;
 
-    if (!rows.length && !last) {
-      setAlarm('crit', '无数据', '服务端从未收到任何批次。检查设备供电、WiFi 与服务端地址。');
-    } else if (!last) {
-      setAlarm('crit', '无数据', '查询窗口内没有任何样本。');
+    const counts = rd.trust.counts || {};
+    const nonFresh = Object.entries(counts).filter(([t]) => t !== 'ntp_fresh');
+    const nonFreshN = nonFresh.reduce((n, [, c]) => n + c, 0);
+
+    if (!last) {
+      setAlarm('crit', '无数据', rows.length
+        ? '查询窗口内没有任何样本。'
+        : '服务端从未收到任何批次。检查设备供电、WiFi 与服务端地址。');
     } else if (last.age_ms > OFFLINE_MS) {
       setAlarm('crit', '设备失联 · 已有 ' + fmtAge(last.age_ms) + ' 无数据',
         '最后一次上传 ' + fmtTime(last.t_server_recv_ms) + '（' + last.device_mac + '）。'
@@ -520,18 +527,14 @@ async function tick() {
     } else if (recentDrop > 0) {
       setAlarm('warn', '板上丢弃 ' + recentDrop + ' 个样本',
         '上传持续失败导致环形缓冲溢出，设备已如实记账。');
+    } else if (nonFreshN > 0) {
+      setAlarm('warn', '时间戳可信度不足 · ' + nonFreshN + ' / ' + rows.length + ' 个样本不可参考',
+        nonFresh.map(([t, c]) => TRUST_TEXT[t] + ' ' + c).join('，')
+        + '　服务端接收时间仍然权威，数据本身没有丢失。');
     } else if (st.total_dropped > 0) {
       setAlarm('warn', '历史累计丢弃 ' + st.total_dropped + ' 个样本', '当前窗口内无新增丢失。');
     } else {
       setAlarm('ok', '链路正常', '数据持续到达，无丢弃、无缺口、时间戳可信。');
-    }
-
-    const worst = Object.keys(rd.trust.counts || {});
-    if (worst.length && !worst.every(t => t === 'ntp_fresh')) {
-      const bad = worst.filter(t => t !== 'ntp_fresh')
-        .map(t => TRUST_TEXT[t] + ' ' + rd.trust.counts[t]).join('，');
-      const a = $('alarm');
-      a.appendChild(el('span', 'sub', '⚠ 窗口内存在非新鲜时间戳：' + bad));
     }
 
     $('refreshed').textContent = '最近刷新 ' + new Date().toLocaleTimeString('zh-CN', { hour12:false })

@@ -1,0 +1,26 @@
+# WiFi 凭据 —— 绝不入库
+firmware/include/secrets.h
+firmware/src/secrets.h
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 数据库
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# PlatformIO
+.pio/
+firmware/.pio/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

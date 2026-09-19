@@ -233,3 +233,107 @@ def test_read_endpoints_stay_public(auth_client):
     """鉴权只保护写入。读接口公开，否则界面会在浏览器里被拦下。"""
     assert auth_client.get("/api/v1/readings").status_code == 200
     assert auth_client.get("/api/v1/status").status_code == 200
+
+
+# ---- 采集开关 ----
+# 停止后界面会安静下来，和"设备失联"长得一模一样。所以开关的历史必须留下来，
+# 且开关本身要能鉴权——否则外人可以远程把采集停掉，受害者完全察觉不到。
+
+@pytest.fixture
+def control_client(tmp_path, monkeypatch):
+    monkeypatch.setattr(app_module, "DB_PATH", str(tmp_path / "ctl.db"))
+    monkeypatch.setattr(app_module, "CONTROL_TOKEN", None)
+    with TestClient(app_module.app) as c:
+        yield c
+
+
+@pytest.fixture
+def control_auth_client(tmp_path, monkeypatch):
+    monkeypatch.setattr(app_module, "DB_PATH", str(tmp_path / "ctlauth.db"))
+    monkeypatch.setattr(app_module, "CONTROL_TOKEN", "ctl-s3cr3t")
+    with TestClient(app_module.app) as c:
+        yield c
+
+
+def test_control_defaults_to_collecting(control_client):
+    """旧库升级上来没有控制记录，必须按"照常采集"处理，不能凭空停机。"""
+    d = control_client.get("/api/v1/control").json()
+    assert d["collect"] is True
+    assert d["t_server_ms"] is None
+    assert d["history"] == []
+    assert control_client.get("/api/v1/control/state").text == "1"
+
+
+def test_control_stop_and_start_roundtrip(control_client):
+    r = control_client.post("/api/v1/control", json={"collect": False, "note": "手动停止"})
+    assert r.status_code == 200
+    d = r.json()
+    assert d["collect"] is False
+    assert d["note"] == "手动停止"
+    assert d["changed_ago_ms"] < 10_000
+    assert control_client.get("/api/v1/control/state").text == "0"
+
+    d = control_client.post("/api/v1/control", json={"collect": True}).json()
+    assert d["collect"] is True
+    assert control_client.get("/api/v1/control/state").text == "1"
+
+
+def test_control_state_is_bare_plaintext(control_client):
+    """设备端按纯文本解析，多一个换行或 JSON 引号都会让固件认不出来。"""
+    r = control_client.get("/api/v1/control/state")
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("text/plain")
+    assert r.text == "1"
+
+    control_client.post("/api/v1/control", json={"collect": False})
+    r = control_client.get("/api/v1/control/state")
+    assert r.text == "0"
+    assert r.text in ("0", "1")
+
+
+def test_control_repeat_is_not_logged(control_client):
+    """状态没变就不该写历史。否则设备每 2 秒轮询一次也会塞满历史，
+    "变更历史"就不再是变更历史，界面也就无法据此解释空白。"""
+    control_client.post("/api/v1/control", json={"collect": False})
+    control_client.post("/api/v1/control", json={"collect": False})
+    control_client.post("/api/v1/control", json={"collect": False})
+    assert len(control_client.get("/api/v1/control").json()["history"]) == 1
+
+
+def test_control_history_explains_blank_periods(control_client):
+    """历史要给界面提供"停止→恢复"的时间区间。"""
+    control_client.post("/api/v1/control", json={"collect": False, "note": "停一下"})
+    control_client.post("/api/v1/control", json={"collect": True, "note": "继续"})
+    control_client.post("/api/v1/control", json={"collect": False, "note": "再停"})
+
+    h = control_client.get("/api/v1/control").json()["history"]
+    assert [x["collect"] for x in h] == [False, True, False], "应按时间升序返回"
+    assert [x["note"] for x in h] == ["停一下", "继续", "再停"]
+    assert all(x["t_server_ms"] > 0 for x in h)
+    assert h[0]["t_server_ms"] <= h[1]["t_server_ms"] <= h[2]["t_server_ms"]
+
+
+def test_control_rejects_bad_token(control_auth_client):
+    r = control_auth_client.post("/api/v1/control", json={"collect": False})
+    assert r.status_code == 401
+    assert control_auth_client.get("/api/v1/control/state").text == "1", \
+        "被拒的请求不能真的把采集停掉"
+
+    r = control_auth_client.post("/api/v1/control", json={"collect": False},
+                                 headers={"X-Control-Token": "ctl-s3cr3X"})
+    assert r.status_code == 401
+    assert control_auth_client.get("/api/v1/control/state").text == "1"
+
+
+def test_control_accepts_correct_token(control_auth_client):
+    r = control_auth_client.post("/api/v1/control", json={"collect": False},
+                                 headers={"X-Control-Token": "ctl-s3cr3t"})
+    assert r.status_code == 200
+    assert control_auth_client.get("/api/v1/control/state").text == "0"
+
+
+def test_control_state_readable_without_token(control_auth_client):
+    """设备轮询接口刻意不鉴权：板子把"取不到"当成"照常采集"，
+    配错令牌会让它静默不停采——那种失败在界面上看不出来。"""
+    assert control_auth_client.get("/api/v1/control/state").status_code == 200
+    assert control_auth_client.get("/api/v1/control").status_code == 200

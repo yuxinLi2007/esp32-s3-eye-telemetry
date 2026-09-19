@@ -50,6 +50,17 @@ CREATE TABLE IF NOT EXISTS readings (
 CREATE INDEX IF NOT EXISTS idx_readings_seq     ON readings (boot_id, seq);
 CREATE INDEX IF NOT EXISTS idx_readings_batch   ON readings (batch_id);
 CREATE INDEX IF NOT EXISTS idx_batches_recv     ON batches (t_server_recv_ms);
+
+-- 采集开关的变更历史。当前状态 = 最后一条，不另设单行表——
+-- 同一个事实存两处必然会漂移（和 trust_level 不落库是同一个道理）。
+-- 保留历史是为了让界面能把"某段空白"解释成用户主动停止，而不是设备故障：
+-- 这两件事在图上长得一模一样，只能靠这里区分。
+CREATE TABLE IF NOT EXISTS control_log (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    collect     INTEGER NOT NULL,
+    t_server_ms INTEGER NOT NULL,
+    note        TEXT
+);
 """
 
 
@@ -261,3 +272,47 @@ def get_status(conn):
             "t_trust": trust_level(last["ntp_synced"], last["ntp_sync_age_s"]),
         }
     return status
+
+
+def get_control(conn, history_limit=50):
+    """当前采集开关，附带最近的变更历史。
+
+    没有任何记录时默认"采集开"——旧库升级上来行为不变，也不会因为忘了初始化而停机。
+    """
+    rows = conn.execute(
+        "SELECT collect, t_server_ms, note FROM control_log ORDER BY id DESC LIMIT ?",
+        (history_limit,),
+    ).fetchall()
+    if not rows:
+        return {
+            "collect": True,
+            "t_server_ms": None,
+            "changed_ago_ms": None,
+            "note": "尚无控制指令，按默认采集",
+            "history": [],
+        }
+    latest = dict(rows[0])
+    now_ms = int(time.time() * 1000)
+    return {
+        "collect": bool(latest["collect"]),
+        "t_server_ms": latest["t_server_ms"],
+        "changed_ago_ms": now_ms - latest["t_server_ms"],
+        "note": latest["note"],
+        "history": [dict(r) for r in reversed(rows)],
+    }
+
+
+def set_control(conn, collect, note=None):
+    """设置采集开关。
+
+    状态没变就不写新记录，否则设备每轮轮询、用户每次误点都会往历史里塞重复行，
+    历史就不再是"变更历史"了。
+    """
+    if get_control(conn)["collect"] == collect:
+        return get_control(conn)
+    conn.execute(
+        "INSERT INTO control_log (collect, t_server_ms, note) VALUES (?,?,?)",
+        (1 if collect else 0, int(time.time() * 1000), note),
+    )
+    conn.commit()
+    return get_control(conn)

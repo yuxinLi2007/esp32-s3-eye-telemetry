@@ -32,6 +32,11 @@
 #define RING_CAPACITY       240   // 12 秒缓冲
 #define MAX_BATCH           100   // 单次上传样本上限
 
+// 轮询服务端采集开关的间隔。取 2 秒是因为"按了停止"到"板子真停"的延迟
+// 就是这个值，太长会让按钮显得没反应。代价是每 2 秒多一次 HTTP 请求，
+// 在局域网里可以忽略，而且它阻塞的时间也计入采样间隔的抖动。
+#define CONTROL_POLL_MS     2000
+
 #define FW_VERSION          "0.1.0"
 
 // 必须明显小于服务端 db.NTP_FRESH_THRESHOLD_S(300 秒)。

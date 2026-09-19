@@ -10,7 +10,8 @@ import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -26,6 +27,11 @@ MAX_READINGS_PER_BATCH = 500
 # "数据来源可追溯"就无从谈起。本地开发可以不设，公网部署必须先设。
 INGEST_TOKEN = os.environ.get("INGEST_TOKEN")
 
+# 采集开关的鉴权，口径同 INGEST_TOKEN。这个开关比入库更该设：一旦被外人停掉，
+# 板子照样在跑、只是不再上传，界面看上去和"设备失联"一模一样——受害者察觉不到。
+CONTROL_TOKEN = os.environ.get("CONTROL_TOKEN")
+
+
 @asynccontextmanager
 async def lifespan(_app):
     db.init_db(DB_PATH).close()
@@ -34,10 +40,25 @@ async def lifespan(_app):
             "[warn] 未设置 INGEST_TOKEN：/api/v1/ingest 不校验来源，"
             "任何能访问该端口的人都能以任意 MAC 注入数据。公网部署前必须设置。"
         )
+    if not CONTROL_TOKEN:
+        print(
+            "[warn] 未设置 CONTROL_TOKEN：任何人访问 /api/v1/control 都能远停采集，"
+            "而界面上只会表现为设备失联。公网部署前必须设置。"
+        )
     yield
 
 
 app = FastAPI(title="ESP32-S3-EYE Telemetry", version="0.1.0", lifespan=lifespan)
+
+# 允许跨源读取：网页用 file:// 直接打开时 Origin 是字符串 "null"，
+# 不带这条中间件浏览器会拦掉所有响应，页面就永远是空的。
+# 只用 allow_origins 不带 allow_credentials——不涉及 Cookie，开了反而会被浏览器拒绝。
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
+)
 
 
 def get_conn():
@@ -171,6 +192,42 @@ def batches(
         "SELECT * FROM batches ORDER BY id DESC LIMIT ?", (limit,)
     ).fetchall()
     return {"ok": True, "count": len(rows), "batches": [dict(r) for r in rows]}
+
+
+class ControlRequest(BaseModel):
+    collect: bool
+    note: str | None = None
+
+
+def require_control_token(request: Request):
+    if not CONTROL_TOKEN:
+        return
+    got = request.headers.get("x-control-token") or ""
+    if not secrets.compare_digest(got, CONTROL_TOKEN):
+        raise HTTPException(status_code=401, detail="X-Control-Token 缺失或不正确")
+
+
+@app.get("/api/v1/control")
+def control_get(conn=Depends(get_conn)):
+    return {"ok": True, **db.get_control(conn)}
+
+
+@app.post(
+    "/api/v1/control", dependencies=[Depends(require_control_token)]
+)
+def control_set(payload: ControlRequest, conn=Depends(get_conn)):
+    return {"ok": True, **db.set_control(conn, payload.collect, payload.note)}
+
+
+@app.get("/api/v1/control/state")
+def control_state(conn=Depends(get_conn)):
+    """给设备轮询用。刻意返回纯文本 "1"/"0"：板端解析 JSON 要多引一个库、
+    多几百字节 RAM 和一个可能失败的解析分支，而这里只有一个布尔值。
+    板端把"取不到"当成"照常采集"，所以这个接口刻意不设鉴权，免得密钥配错时
+    板子静默停采——那种失败在界面上看不出来，恰恰是本项目最不想要的那种。
+    """
+    state = "1" if db.get_control(conn)["collect"] else "0"
+    return Response(content=state, media_type="text/plain")
 
 
 # 界面挂在最后：Starlette 按注册顺序匹配，先注册的 /api 与 /health 不会被它抢走。

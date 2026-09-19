@@ -45,9 +45,14 @@ globalThis.document = {
   getElementById(id) { if (!els.has(id)) els.set(id, makeEl()); return els.get(id); },
   createElement: t => makeEl(t),
   createTextNode: t => ({ children: [], textContent: String(t), appendChild() {} }),
+  title: '',
 };
-globalThis.window = { devicePixelRatio: 1, addEventListener() {} };
+globalThis.window = { devicePixelRatio: 1, addEventListener() {}, prompt: () => null };
 globalThis.setInterval = () => 0;
+// 桩成"由服务端提供页面"这一种情况：这样脚本走同源相对路径，
+// 下面 fetch 桩再把相对路径补成绝对地址。file:// 分支另有单测覆盖。
+globalThis.location = { protocol: 'http:', search: '', href: 'http://x/' };
+globalThis.localStorage = { getItem: () => null, setItem() {}, removeItem() {} };
 
 // 浏览器里相对路径按页面 origin 解析；node 没有 origin，这里补上
 const nativeFetch = globalThis.fetch;
@@ -57,7 +62,8 @@ globalThis.fetch = (u, o) =>
 const get = id => document.getElementById(id);
 const txt = e => (e?.children || []).map(c => c.textContent).join('') || e?.textContent || '';
 
-const api = new Function(code + '\n;return {buildSeries, trustOf, TRUST_TEXT};')();
+const api = new Function(
+  code + '\n;return {buildSeries, trustOf, TRUST_TEXT, stopIntervals};')();
 await new Promise(r => setTimeout(r, 1800));
 
 const alarm = get('alarm');
@@ -77,11 +83,19 @@ if (kv) {
     console.log('  ', kv.children[i].textContent, '=', txt(kv.children[i + 1]));
 }
 
+// 采集开关：按钮可用性必须跟真实状态一致，否则会出现"点停止反而把采集开回来"
+const cd = await (await fetch('/api/v1/control')).json();
+console.log('\n--- 采集开关 ---');
+console.log('状态栏:', txt(get('ctl_state')));
+console.log('开始键禁用:', get('btn_start').disabled, ' 停止键禁用:', get('btn_stop').disabled);
+console.log('预期(采集开时):', '开始禁用=true 停止禁用=false');
+console.log('停止区间:', JSON.stringify(api.stopIntervals(cd.history, Date.now())));
+
 const rr = await (await fetch('/api/v1/readings?limit=3000')).json();
-const s = api.buildSeries(rr.readings);
+const s = api.buildSeries(rr.readings, api.stopIntervals(cd.history, Date.now()));
 console.log('\n--- 分段/缺口判定 ---');
 console.log('样本数:', rr.readings.length, ' 连续段数:', s.segs.length, ' 断开带:', s.bands.length);
-for (const b of s.bands.slice(0, 10)) console.log('   带:', b.reason);
+for (const b of s.bands.slice(0, 10)) console.log('   带:', b.kind, b.reason);
 console.log('SPL 为 null 的点:', s.pts.filter(p => p.spl === null).length);
 console.log('|a| 落在 0.8~1.2 之外:', s.pts.filter(p => p.mag !== null && (p.mag < 0.8 || p.mag > 1.2)).length);
 console.log('x 单调递增:', s.pts.every((p, i) => i === 0 || p.x >= s.pts[i - 1].x));

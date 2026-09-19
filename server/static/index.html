@@ -23,6 +23,9 @@
   .a-ok   { background:#0d2a17; color:#7ee787; }
   .a-warn { background:#3a2d08; color:#f0c674; }
   .a-crit { background:#4a1512; color:#ff9d97; }
+  /* 主动停止不是故障。用中性蓝而不是绿：绿色会被读成"一切正常"，
+     但此刻数据确实是断的，只是原因已知。 */
+  .a-info { background:#0d2137; color:#79c0ff; }
 
   .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr));
            gap:10px; margin:16px 0; }
@@ -63,9 +66,17 @@
   .b-unsynced    { background:#4a1512; color:#ff9d97; }
 
   .controls { display:flex; gap:10px; align-items:center; margin:16px 0 0;
-              color:var(--dim); font-size:12px; }
+              color:var(--dim); font-size:12px; flex-wrap:wrap; }
   select { background:var(--panel); color:var(--fg); border:1px solid var(--line);
            border-radius:6px; padding:4px 8px; font:inherit; }
+  .btn { background:var(--panel); color:var(--fg); border:1px solid var(--line);
+         border-radius:6px; padding:4px 12px; font:inherit; cursor:pointer; }
+  .btn:hover:not(:disabled) { border-color:var(--dim); }
+  .btn:disabled { opacity:.35; cursor:default; }
+  .btn.go   { border-color:var(--ok);   color:#7ee787; }
+  .btn.halt { border-color:var(--crit); color:#ff9d97; }
+  #ctl_state { color:var(--fg); }
+  #refreshed { margin-left:auto; }
   .note { color:var(--dim); font-size:11px; margin-top:6px; }
   .tip { position:absolute; pointer-events:none; background:#1c2229; border:1px solid var(--line);
          border-radius:6px; padding:6px 8px; font-size:11px; display:none; z-index:5;
@@ -83,6 +94,9 @@
       <option value="3000" selected>最近 3000 个样本（约 3 分钟）</option>
       <option value="10000">最近 10000 个样本（约 10 分钟）</option>
     </select>
+    <button class="btn go"   id="btn_start">开始采集</button>
+    <button class="btn halt" id="btn_stop">停止采集</button>
+    <span id="ctl_state"></span>
     <span id="refreshed"></span>
   </div>
 
@@ -144,6 +158,28 @@ const COL = { ok:'#2ea043', warn:'#d29922', crit:'#da3633', info:'#388bfd',
 
 const $ = id => document.getElementById(id);
 
+// 用 file:// 直接双击打开时，相对路径会被解析成 file:///api/v1/...，永远拿不到数据。
+// 所以那种情况下必须换成服务端的绝对地址。服务端本身已经在跑——数据存在它的
+// SQLite 里，光有 HTML 文件无论如何都变不出数据来。
+//   优先 ?api=http://host:8000（顺便记住）→ 上次记住的 → 本机默认
+const API = (() => {
+  const q = new URLSearchParams(location.search).get('api');
+  if (q) { try { localStorage.setItem('api_base', q); } catch (e) {} }
+  if (location.protocol !== 'file:') return '';   // 由服务端提供时走同源相对路径
+  let saved = q || null;
+  if (!saved) { try { saved = localStorage.getItem('api_base'); } catch (e) {} }
+  return (saved || 'http://127.0.0.1:8000').replace(/\/+$/, '');
+})();
+const api = p => API + p;
+
+// 服务端设了 CONTROL_TOKEN 才用得上。网页里不可能预置密钥——HTML 本身是要发出去的，
+// 所以首次 401 时现问一次再记住。
+let ctlToken = null;
+try { ctlToken = localStorage.getItem('ctl_token'); } catch (e) {}
+const ctlHeaders = () =>
+  Object.assign({ 'Content-Type': 'application/json' },
+                ctlToken ? { 'X-Control-Token': ctlToken } : {});
+
 // 与服务端 db.trust_level 同规则。设备端时间只有在 NTP 同步过且足够新鲜时才可参考。
 function trustOf(synced, age) {
   if (!synced || age === null || age === undefined) return 'unsynced';
@@ -163,10 +199,24 @@ const fmtTime = ms => ms === null || ms === undefined ? '—'
     + String(ms % 1000).padStart(3, '0');
 const fmtAge = ms => ms < 1000 ? ms + ' ms' : (ms / 1000).toFixed(1) + ' s';
 
+// 把控制历史配对成"停止 → 恢复"的区间（服务端时间）。
+// 这是 control_log 存在的唯一理由：一段空白到底是用户按了停止，还是设备坏了，
+// 光看图分不出来，只能靠这里给出的时间区间去对。
+function stopIntervals(history, now) {
+  const out = [];
+  let open = null;
+  for (const h of history || []) {
+    if (!h.collect && open === null) open = h.t_server_ms;
+    else if (h.collect && open !== null) { out.push([open, h.t_server_ms]); open = null; }
+  }
+  if (open !== null) out.push([open, now]);   // 仍未恢复
+  return out;
+}
+
 // 把逐条样本整理成可绘制序列。
 // x = 批次的服务端接收时刻 + 批内设备时钟偏移（偏移 <= 0），
 // 于是每条样本都锚在权威时间上，设备绝对时钟不参与。
-function buildSeries(rows) {
+function buildSeries(rows, stops) {
   const byBatch = new Map();
   for (const r of rows) {
     const key = r.boot_id + '@' + r.t_server_recv_ms;
@@ -198,17 +248,24 @@ function buildSeries(rows) {
   const segs = [], bands = [];
   let cur = null, prev = null;
   for (const p of pts) {
-    let reason = null;
+    let reason = null, kind = 'lost';
     if (prev) {
       const r = p.raw, q = prev.raw;
       if (r.boot_id !== q.boot_id)        reason = '设备重启 ' + q.boot_id + ' → ' + r.boot_id;
       else if (r.seq > q.seq + 1)         reason = '丢样 ' + (r.seq - q.seq - 1) + ' 个（seq '
                                                    + q.seq + ' → ' + r.seq + '）';
-      else if (p.x - prev.x > UPLOAD_INTERVAL_MS * 3)
-                                          reason = '上传中断 ' + fmtAge(p.x - prev.x);
+      else if (p.x - prev.x > UPLOAD_INTERVAL_MS * 3) {
+        // 落在控制历史记录的停止区间里 = 用户主动停的，不算故障，按中性色画。
+        // 不这么分的话，"我按了停止"和"设备挂了"在图上长得一模一样。
+        if ((stops || []).some(v => prev.x < v[1] && p.x > v[0])) {
+          reason = '已停止采集 ' + fmtAge(p.x - prev.x); kind = 'stopped';
+        } else {
+          reason = '上传中断 ' + fmtAge(p.x - prev.x);
+        }
+      }
     }
     if (reason || !cur) {
-      if (reason) bands.push({ x0: prev.x, x1: p.x, reason });
+      if (reason) bands.push({ x0: prev.x, x1: p.x, reason, kind });
       cur = { pts: [] };
       segs.push(cur);
     }
@@ -290,19 +347,29 @@ function drawChart(canvas, tip, series, opts) {
     g.restore();
   }
 
-  // 丢样/重启竖带 —— 让"数据缺失"在图上占面积，而不是一条线悄悄连过去
+  // 丢样/重启/停止竖带 —— 让"这段没有数据"在图上占面积，而不是一条线悄悄连过去。
+  // 红色限于真故障；主动停止用中性灰，否则用户自己按的停止会被当成设备坏了。
   for (const b of series.bands) {
+    const held = b.kind === 'stopped';
     const bx0 = Math.max(X(b.x0), L), bx1 = Math.max(X(b.x1), L);
     const w = Math.max(bx1 - bx0, 2);
-    g.fillStyle = 'rgba(218,54,51,.22)';
+    g.fillStyle = held ? 'rgba(139,148,158,.16)' : 'rgba(218,54,51,.22)';
     g.fillRect(bx0, T, w, ph);
-    g.strokeStyle = 'rgba(218,54,51,.9)'; g.lineWidth = 1;
+    g.strokeStyle = held ? 'rgba(139,148,158,.85)' : 'rgba(218,54,51,.9)';
+    g.lineWidth = 1;
     g.beginPath(); g.moveTo(bx0 + w / 2, T); g.lineTo(bx0 + w / 2, T + ph); g.stroke();
   }
 
-  // 数据之后到现在的空白：设备失联时这段必须可见
+  // 数据之后到现在的空白：设备失联时这段必须可见。
+  // 但"已经停采"和"突然没了"必须区分开，否则停止采集会伪装成失联报警。
   const lastX = Math.max(...xs);
-  if (series.now - lastX > ONLINE_MS) {
+  if (series.stopped) {
+    const bx = Math.max(X(lastX), L);
+    g.fillStyle = 'rgba(139,148,158,.16)';
+    g.fillRect(bx, T, L + pw - bx, ph);
+    g.fillStyle = 'rgba(200,205,212,.9)'; g.textAlign = 'left'; g.textBaseline = 'top';
+    g.fillText('已停止采集', bx + 6, T + 6);
+  } else if (series.now - lastX > ONLINE_MS) {
     const bx = Math.max(X(lastX), L);
     g.fillStyle = 'rgba(218,54,51,.12)';
     g.fillRect(bx, T, L + pw - bx, ph);
@@ -359,10 +426,14 @@ function setAlarm(level, title, sub) {
   if (sub) a.appendChild(el('span', 'sub', sub));
 }
 
+// 最近一次取到的采集开关状态。null = 还没取到。
+let ctl = null;
+
 function renderCards(st, rows, series) {
   const cards = $('cards');
   cards.innerHTML = '';
   const last = st.last_batch;
+  const stopped = !!ctl && !ctl.collect;
   const missing = series.bands.filter(b => b.reason.startsWith('丢样')).length;
   const missingN = rows.length ? (() => {
     let n = 0, prev = null;
@@ -373,13 +444,23 @@ function renderCards(st, rows, series) {
     return n;
   })() : 0;
 
+  // 停止采集后设备本就该安静。旧数据停在那里不是"失联"，
+  // 但也不能就此说"一切正常"——状态卡要如实说"已停止"。
+  const devState = !last ? '无数据'
+    : stopped ? (last.age_ms > ONLINE_MS ? '已停止采集' : '收尾中')
+    : last.age_ms > OFFLINE_MS ? '失联'
+    : last.age_ms > ONLINE_MS ? '延迟' : '在线';
+
   const defs = [
-    { k:'设备状态', v: last ? (last.age_ms > OFFLINE_MS ? '失联' : last.age_ms > ONLINE_MS ? '延迟' : '在线')
-                            : '无数据',
-      cls: !last ? 'bad' : last.age_ms > OFFLINE_MS ? 'bad'
+    { k:'设备状态', v: devState,
+      cls: !last ? 'bad' : stopped ? ''
+                  : last.age_ms > OFFLINE_MS ? 'bad'
                   : last.age_ms > ONLINE_MS ? 'warn' : '' },
+    // 停止采集时设备本来就该安静，这个数字照报但不着色。
+    // 标红会和上方"已停止采集"的蓝色提示自相矛盾——同一屏两个相反结论。
     { k:'最近一批距今', v: last ? fmtAge(last.age_ms) : '—',
-      cls: last && last.age_ms > OFFLINE_MS ? 'bad' : last && last.age_ms > ONLINE_MS ? 'warn' : '' },
+      cls: stopped ? '' : last && last.age_ms > OFFLINE_MS ? 'bad'
+                       : last && last.age_ms > ONLINE_MS ? 'warn' : '' },
     { k:'窗口内样本', v: rows.length },
     { k:'窗口内缺口', v: missing + ' 处', u: missingN ? '共丢 ' + missingN + ' 个' : '',
       cls: missingN ? 'warn' : '' },
@@ -465,21 +546,65 @@ function renderTable(rows) {
   }
 }
 
-let inflight = false;
+// 按钮状态由当前开关决定，不是自己记一个。两处状态必然会漂移——
+// 比如另一个标签页按了停止，这里还显示"停止"可点，点下去反而把采集开回来。
+function renderControl() {
+  const known = !!ctl;
+  $('ctl_state').textContent = !known ? '采集状态未知'
+    : (ctl.collect ? '采集：开' : '采集：已停止')
+      + (ctl.changed_ago_ms === null ? '' : '（' + fmtAge(ctl.changed_ago_ms) + '前）')
+      + (ctl.note ? '　' + ctl.note : '');
+  $('btn_start').disabled = !known || ctl.collect || ctlBusy;
+  $('btn_stop').disabled  = !known || !ctl.collect || ctlBusy;
+}
+
+async function onControl(collect) {
+  if (ctlBusy) return;
+  ctlBusy = true;
+  renderControl();
+  try {
+    let r = await fetch(api('/api/v1/control'), {
+      method:'POST', headers: ctlHeaders(),
+      body: JSON.stringify({ collect, note: collect ? '界面手动开始' : '界面手动停止' }),
+    });
+    if (r.status === 401) {
+      const t = window.prompt('服务端设置了 CONTROL_TOKEN，改变采集开关需要它：');
+      if (t) { ctlToken = t; try { localStorage.setItem('ctl_token', t); } catch (e) {} }
+      if (!t) throw new Error('未提供 CONTROL_TOKEN');
+      r = await fetch(api('/api/v1/control'), {
+        method:'POST', headers: ctlHeaders(),
+        body: JSON.stringify({ collect, note: collect ? '界面手动开始' : '界面手动停止' }),
+      });
+    }
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+  } catch (e) {
+    setAlarm('crit', (collect ? '开启' : '停止') + '采集失败',
+             String(e.message || e) + '　开关状态未改变。');
+  } finally {
+    ctlBusy = false;
+    tick();
+  }
+}
+
+let inflight = false, ctlBusy = false;
 async function tick() {
   if (inflight) return;
   inflight = true;
   try {
     const limit = $('limit').value;
-    const [sr, rr] = await Promise.all([
-      fetch('/api/v1/status', { cache:'no-store' }),
-      fetch('/api/v1/readings?limit=' + limit, { cache:'no-store' }),
+    const [sr, rr, cr] = await Promise.all([
+      fetch(api('/api/v1/status'), { cache:'no-store' }),
+      fetch(api('/api/v1/readings?limit=' + limit), { cache:'no-store' }),
+      fetch(api('/api/v1/control'), { cache:'no-store' }),
     ]);
-    if (!sr.ok || !rr.ok) throw new Error('HTTP ' + sr.status + '/' + rr.status);
-    const st = await sr.json(), rd = await rr.json();
+    if (!sr.ok || !rr.ok || !cr.ok) throw new Error('HTTP ' + sr.status + '/' + rr.status + '/' + cr.status);
+    const st = await sr.json(), rd = await rr.json(), cd = await cr.json();
+    ctl = cd;
+    renderControl();
     const rows = rd.readings || [];
-    const series = buildSeries(rows);
+    const series = buildSeries(rows, stopIntervals(cd.history, st.server_time_ms));
     series.now = st.server_time_ms;
+    series.stopped = !cd.collect;
 
     renderCards(st, rows, series);
     renderProv(st, rows);
@@ -518,10 +643,29 @@ async function tick() {
     const nonFresh = Object.entries(counts).filter(([t]) => t !== 'ntp_fresh');
     const nonFreshN = nonFresh.reduce((n, [, c]) => n + c, 0);
 
+    const stopped = !cd.collect;
+    // 停止后设备应该很快安静下来。若停止指令下发很久之后还在收到新批次，
+    // 说明板子没轮询到指令（或固件没更新）——这不能一路滑进"已停止采集"那个
+    // 中性提示里，否则一次真实的失灵会被描述成用户自己的操作。
+    const ignoring = stopped && cd.t_server_ms !== null
+      && last && last.t_server_recv_ms > cd.t_server_ms + OFFLINE_MS;
+
     if (!last) {
       setAlarm('crit', '无数据', rows.length
         ? '查询窗口内没有任何样本。'
         : '服务端从未收到任何批次。检查设备供电、WiFi 与服务端地址。');
+    } else if (ignoring) {
+      setAlarm('warn', '已下发停止，但仍在收到数据',
+        '停止指令 ' + fmtTime(cd.t_server_ms) + ' 下发，之后仍收到 '
+        + fmtTime(last.t_server_recv_ms) + ' 的批次。设备未执行该指令。');
+    } else if (stopped && last.age_ms > ONLINE_MS) {
+      // 中性色而非红色：这段空白是用户自己按出来的。但"停止期间的数据确实不存在"
+      // 必须说清楚，不能让中性色被读成"什么都没发生"。
+      setAlarm('info', '已停止采集 · ' + (cd.changed_ago_ms === null ? '' : fmtAge(cd.changed_ago_ms) + '前停止'),
+        '最后一次上传 ' + fmtTime(last.t_server_recv_ms) + '（' + last.device_mac + '）。'
+        + '此处的空白是主动停止而非设备故障，但停止期间的数据确实没有采集。');
+    } else if (stopped) {
+      setAlarm('info', '正在停止采集', '设备收尾中：把缓冲区里已采到的样本上传完再停。');
     } else if (last.age_ms > OFFLINE_MS) {
       setAlarm('crit', '设备失联 · 已有 ' + fmtAge(last.age_ms) + ' 无数据',
         '最后一次上传 ' + fmtTime(last.t_server_recv_ms) + '（' + last.device_mac + '）。'
@@ -556,9 +700,15 @@ async function tick() {
 }
 
 $('limit').addEventListener('change', tick);
+$('btn_start').addEventListener('click', () => onControl(true));
+$('btn_stop').addEventListener('click', () => onControl(false));
 window.addEventListener('resize', tick);
 tick();
 setInterval(tick, UPLOAD_INTERVAL_MS);
+
+// 页面用 file:// 打开时要连的是哪台服务端，只有打开的人知道。
+// 把当前实际用的地址摆出来，省得"没数据"的时候要靠猜。
+if (API) document.title = 'ESP32-S3-EYE 遥测 · ' + API;
 </script>
 </body>
 </html>

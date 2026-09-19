@@ -42,6 +42,11 @@ static uint32_t g_last_ntp_request = 0;
 static Preferences g_prefs;
 static uint32_t g_dropped_lifetime = 0;
 
+// ---- 采集开关 ----
+// 默认"开"。取不到服务端状态时维持现状，不因为一次网络抖动就自行停采——
+// 那种停止在界面上没有任何痕迹，正是本项目最该避免的失败方式。
+static bool g_collect = true;
+
 static void make_boot_id() {
   uint32_t r = esp_random();
   snprintf(g_boot_id, sizeof(g_boot_id), "%08X", r);
@@ -122,6 +127,33 @@ static void ntp_ensure() {
     // 查询成功时由回调把年龄清零；一直失败就让它如实增长直到越过阈值。
     sntp_restart();
   }
+}
+
+// 轮询服务端的采集开关。返回体刻意是纯文本 "1"/"0"：只有一个布尔值，
+// 不值得为它引入 JSON 解析。
+// 只有明确读到 "0" 才停；其余情况（超时、非 200、内容不认识）一律当"继续采集"。
+static void control_poll() {
+  static uint32_t last = 0;
+  if (last != 0 && millis() - last < CONTROL_POLL_MS) return;
+  last = millis();
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  HTTPClient http;
+  http.setTimeout(2000);
+  http.setConnectTimeout(2000);
+  if (!http.begin(String(SERVER_URL) + "/api/v1/control/state")) return;
+  int code = http.GET();
+  if (code == 200) {
+    String body = http.getString();
+    body.trim();
+    bool want = (body != "0");
+    if (want != g_collect) {
+      Serial.printf("[ctl] 采集 %s -> %s\n", g_collect ? "开" : "停",
+                    want ? "开" : "停（缓冲区里已采到的样本仍会传完）");
+      g_collect = want;
+    }
+  }
+  http.end();
 }
 
 static String build_payload(uint16_t n) {
@@ -245,12 +277,17 @@ void loop() {
   uint32_t now = millis();
 
   wifi_ensure();
-  if (WiFi.status() == WL_CONNECTED) ntp_ensure();
+  if (WiFi.status() == WL_CONNECTED) {
+    ntp_ensure();
+    control_poll();
+  }
 
   static uint32_t last_sample = 0;
   static uint32_t last_upload = 0;
 
-  if (now - last_sample >= SAMPLE_INTERVAL_MS) {
+  // 停止采集只停"采样"，不停"上传"：缓冲区里已经采到的样本要照常传完。
+  // 按一次停止就丢掉手上已有数据，等于让用户的操作毁掉数据。
+  if (g_collect && now - last_sample >= SAMPLE_INTERVAL_MS) {
     last_sample = now;
     Sample s = {};
     s.seq = g_seq++;

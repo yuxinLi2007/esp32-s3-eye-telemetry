@@ -229,8 +229,8 @@ function drawChart(canvas, tip, series, opts) {
   g.setTransform(dpr, 0, 0, dpr, 0, 0);
   g.clearRect(0, 0, cssW, cssH);
 
-  const L = 46, R = 10, T = 10, B = 20;
-  const pw = cssW - L - R, ph = cssH - T - B;
+  let L = 46; const R = 10, T = 10, B = 20;
+  let pw = cssW - L - R; const ph = cssH - T - B;
 
   const all = series.pts.filter(p => p[opts.field] !== null && p[opts.field] !== undefined);
   if (!all.length || !series.pts.length) {
@@ -255,6 +255,14 @@ function drawChart(canvas, tip, series, opts) {
   const pad = (hi - lo) * 0.15 || 0.05;
   lo -= pad; hi += pad;
 
+  // 量程窄的时候固定小数位会把 5 条刻度印成同一个数（1.000 / 1.000 / 1.000），
+  // 纵轴等于没有信息——设备静止时 |a| 的跨度就只有千分之几，这一定会发生。
+  // 按实际刻度间隔决定精度，保证相邻刻度可区分；位数不够时把左侧留白加宽。
+  const gstep = (hi - lo) / 4;
+  const dec = Math.min(6, Math.max(opts.decimals,
+    gstep > 0 ? Math.ceil(-Math.log10(gstep)) : opts.decimals));
+  if (dec > 3) { L = 46 + (dec - 3) * 7; pw = cssW - L - R; }
+
   const X = t => L + (t - x0) / (x1 - x0) * pw;
   const Y = v => T + (hi - v) / (hi - lo) * ph;
 
@@ -266,7 +274,7 @@ function drawChart(canvas, tip, series, opts) {
     g.strokeStyle = COL.grid; g.beginPath();
     g.moveTo(L, y); g.lineTo(L + pw, y); g.stroke();
     g.fillStyle = COL.dim;
-    g.fillText(v.toFixed(opts.decimals), L - 6, y);
+    g.fillText(v.toFixed(dec), L - 6, y);
   }
   g.textAlign = 'center'; g.textBaseline = 'top';
   for (let i = 0; i <= 5; i++) {

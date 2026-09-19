@@ -10,6 +10,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, Query, Request
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 import db
@@ -17,6 +18,7 @@ import db
 DB_PATH = os.environ.get(
     "TELEMETRY_DB", str(Path(__file__).parent / "data" / "telemetry.db")
 )
+STATIC_DIR = Path(__file__).parent / "static"
 MAX_READINGS_PER_BATCH = 500
 
 @asynccontextmanager
@@ -148,3 +150,7 @@ def batches(
         "SELECT * FROM batches ORDER BY id DESC LIMIT ?", (limit,)
     ).fetchall()
     return {"ok": True, "count": len(rows), "batches": [dict(r) for r in rows]}
+
+
+# 界面挂在最后：Starlette 按注册顺序匹配，先注册的 /api 与 /health 不会被它抢走。
+app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="static")

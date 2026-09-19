@@ -55,7 +55,10 @@ CREATE INDEX IF NOT EXISTS idx_batches_recv     ON batches (t_server_recv_ms);
 
 def connect(path):
     Path(path).parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path, timeout=10.0)
+    # check_same_thread=False：FastAPI 把同步依赖和同步端点分别丢进线程池，
+    # 两者不保证落在同一个线程上。连接是每请求新建、用完即关，依赖先于端点返回，
+    # 所以只是"跨线程先后使用"，不存在并发访问。默认的线程校验会误报 500。
+    conn = sqlite3.connect(path, timeout=10.0, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")

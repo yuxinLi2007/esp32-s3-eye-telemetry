@@ -1,0 +1,553 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ESP32-S3-EYE 遥测</title>
+<style>
+  :root {
+    --bg:#0e1116; --panel:#161b22; --line:#2a3038; --fg:#e6edf3; --dim:#8b949e;
+    --ok:#2ea043; --warn:#d29922; --crit:#da3633; --info:#388bfd;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+  h3 { margin:0 0 8px; font-size:13px; font-weight:600; color:var(--dim);
+       text-transform:uppercase; letter-spacing:.06em; }
+  .wrap { max-width:1400px; margin:0 auto; padding:0 16px 48px; }
+
+  /* 报警条：整页最显眼的位置，状态不能靠用户自己从图表里猜 */
+  #alarm { padding:14px 16px; font-size:15px; font-weight:600; display:flex;
+           gap:12px; align-items:baseline; border-bottom:1px solid var(--line); }
+  #alarm .sub { font-size:12px; font-weight:400; opacity:.85; }
+  .a-ok   { background:#0d2a17; color:#7ee787; }
+  .a-warn { background:#3a2d08; color:#f0c674; }
+  .a-crit { background:#4a1512; color:#ff9d97; }
+
+  .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr));
+           gap:10px; margin:16px 0; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:8px;
+          padding:10px 12px; }
+  .card .k { font-size:11px; color:var(--dim); }
+  .card .v { font-size:20px; font-weight:600; margin-top:2px; }
+  .card .u { font-size:11px; color:var(--dim); font-weight:400; margin-left:2px; }
+  .card.bad .v { color:var(--crit); }
+  .card.warn .v { color:var(--warn); }
+
+  section { margin:20px 0; }
+  .chartbox { position:relative; background:var(--panel); border:1px solid var(--line);
+              border-radius:8px; padding:10px 12px 6px; margin-bottom:12px; }
+  canvas { width:100%; display:block; cursor:crosshair; }
+
+  .prov { background:var(--panel); border:1px solid var(--line); border-radius:8px;
+          padding:12px; }
+  .kv { display:grid; grid-template-columns:auto 1fr; gap:4px 14px; font-size:12px; }
+  .kv .k { color:var(--dim); }
+  .kv .v { word-break:break-all; }
+
+  .tablewrap { max-height:340px; overflow:auto; border:1px solid var(--line);
+               border-radius:8px; background:var(--panel); }
+  table { border-collapse:collapse; width:100%; font-size:12px; }
+  th,td { padding:5px 10px; text-align:right; white-space:nowrap;
+          border-bottom:1px solid var(--line); }
+  th { position:sticky; top:0; background:#1c2229; color:var(--dim); font-weight:600;
+       text-align:right; z-index:1; }
+  td.l,th.l { text-align:left; }
+  tr.peer td { background:#14181d; }  /* 不同批次隔行，来源边界可见 */
+
+  .badge { display:inline-block; padding:1px 6px; border-radius:10px; font-size:11px;
+           line-height:16px; }
+  .b-ntp_fresh   { background:#0d2a17; color:#7ee787; }
+  .b-ntp_stale   { background:#3a2d08; color:#f0c674; }
+  .b-ntp_expired { background:#3d2408; color:#ffa657; }
+  .b-unsynced    { background:#4a1512; color:#ff9d97; }
+
+  .controls { display:flex; gap:10px; align-items:center; margin:16px 0 0;
+              color:var(--dim); font-size:12px; }
+  select { background:var(--panel); color:var(--fg); border:1px solid var(--line);
+           border-radius:6px; padding:4px 8px; font:inherit; }
+  .note { color:var(--dim); font-size:11px; margin-top:6px; }
+  .tip { position:absolute; pointer-events:none; background:#1c2229; border:1px solid var(--line);
+         border-radius:6px; padding:6px 8px; font-size:11px; display:none; z-index:5;
+         white-space:pre; }
+</style>
+</head>
+<body>
+<div id="alarm" class="a-crit">正在连接服务端 …</div>
+
+<div class="wrap">
+  <div class="controls">
+    <span>窗口</span>
+    <select id="limit">
+      <option value="1000">最近 1000 个样本（约 1 分钟）</option>
+      <option value="3000" selected>最近 3000 个样本（约 3 分钟）</option>
+      <option value="10000">最近 10000 个样本（约 10 分钟）</option>
+    </select>
+    <span id="refreshed"></span>
+  </div>
+
+  <section class="cards" id="cards"></section>
+
+  <section>
+    <h3>数据来源（最近一批）</h3>
+    <div class="prov" id="prov"></div>
+  </section>
+
+  <section>
+    <h3>加速度合矢量 |a|（g）</h3>
+    <div class="chartbox">
+      <canvas id="c_acc"></canvas>
+      <div class="tip" id="tip_acc"></div>
+    </div>
+  </section>
+
+  <section>
+    <h3>声压级 SPL（dB）</h3>
+    <div class="chartbox">
+      <canvas id="c_spl"></canvas>
+      <div class="tip" id="tip_spl"></div>
+    </div>
+  </section>
+  <div class="note">
+    横轴为时间：以「服务端接收该批数据的时刻」为锚点，批内按设备单调时钟排布。
+    不采信设备的绝对时间，因此设备时钟即使错得很远也不会把曲线画歪。
+    红色竖带 = 该区间内确定有样本丢失或设备重启。
+  </div>
+
+  <section>
+    <h3>样本明细</h3>
+    <div class="tablewrap">
+      <table>
+        <thead><tr>
+          <th class="l">seq</th><th class="l">boot</th>
+          <th>设备时间</th><th>服务端接收</th>
+          <th>ax</th><th>ay</th><th>az</th><th>|a|</th><th>SPL</th>
+          <th class="l">时间戳可信度</th><th class="l">来源 IP</th>
+        </tr></thead>
+        <tbody id="tbody"></tbody>
+      </table>
+    </div>
+  </section>
+</div>
+
+<script>
+// 与 firmware/include/config.h 保持一致
+const UPLOAD_INTERVAL_MS = 2000;
+// 与 server/db.py 保持一致
+const NTP_FRESH_S = 300, NTP_STALE_S = 3600;
+
+const ONLINE_MS  = UPLOAD_INTERVAL_MS * 3;   // 6s  正常上传节奏允许的范围
+const OFFLINE_MS = UPLOAD_INTERVAL_MS * 7;   // 14s 连续 7 次没上传即判失联
+
+const COL = { ok:'#2ea043', warn:'#d29922', crit:'#da3633', info:'#388bfd',
+              fg:'#e6edf3', dim:'#8b949e', grid:'#2a3038' };
+
+const $ = id => document.getElementById(id);
+
+// 与服务端 db.trust_level 同规则。设备端时间只有在 NTP 同步过且足够新鲜时才可参考。
+function trustOf(synced, age) {
+  if (!synced || age === null || age === undefined) return 'unsynced';
+  if (age <= NTP_FRESH_S) return 'ntp_fresh';
+  if (age <= NTP_STALE_S) return 'ntp_stale';
+  return 'ntp_expired';
+}
+const TRUST_TEXT = {
+  ntp_fresh:   'NTP 新鲜',
+  ntp_stale:   'NTP 陈旧',
+  ntp_expired: 'NTP 已过期',
+  unsynced:    '未同步',
+};
+
+const fmtTime = ms => ms === null || ms === undefined ? '—'
+  : new Date(ms).toLocaleTimeString('zh-CN', { hour12:false }) + '.'
+    + String(ms % 1000).padStart(3, '0');
+const fmtAge = ms => ms < 1000 ? ms + ' ms' : (ms / 1000).toFixed(1) + ' s';
+
+// 把逐条样本整理成可绘制序列。
+// x = 批次的服务端接收时刻 + 批内设备时钟偏移（偏移 <= 0），
+// 于是每条样本都锚在权威时间上，设备绝对时钟不参与。
+function buildSeries(rows) {
+  const byBatch = new Map();
+  for (const r of rows) {
+    const key = r.boot_id + '@' + r.t_server_recv_ms;
+    let b = byBatch.get(key);
+    if (!b) { b = { recv:r.t_server_recv_ms, boot:r.boot_id, maxDev:-Infinity, rows:[] };
+              byBatch.set(key, b); }
+    b.rows.push(r);
+    if (r.t_device_ms > b.maxDev) b.maxDev = r.t_device_ms;
+  }
+
+  const pts = [];
+  for (const b of byBatch.values()) {
+    for (const r of b.rows) {
+      const mag = (r.ax === null || r.ay === null || r.az === null)
+        ? null : Math.hypot(r.ax, r.ay, r.az);
+      pts.push({
+        x: b.recv + (r.t_device_ms - b.maxDev),
+        mag, spl: r.spl_db, raw: r,
+        trust: trustOf(r.ntp_synced, r.ntp_sync_age_s),
+      });
+    }
+  }
+  pts.sort((a, z) => a.x - z.x);
+
+  // 切段：只有"确定不连续"才断开，不靠时间间隔阈值乱猜。
+  //   1) boot_id 变化   -> 设备重启
+  //   2) 同 boot 内 seq 跳号 -> 板上确有丢样
+  //   3) 接收时刻间隔过大 -> 连续多次上传失败
+  const segs = [], bands = [];
+  let cur = null, prev = null;
+  for (const p of pts) {
+    let reason = null;
+    if (prev) {
+      const r = p.raw, q = prev.raw;
+      if (r.boot_id !== q.boot_id)        reason = '设备重启 ' + q.boot_id + ' → ' + r.boot_id;
+      else if (r.seq > q.seq + 1)         reason = '丢样 ' + (r.seq - q.seq - 1) + ' 个（seq '
+                                                   + q.seq + ' → ' + r.seq + '）';
+      else if (p.x - prev.x > UPLOAD_INTERVAL_MS * 3)
+                                          reason = '上传中断 ' + fmtAge(p.x - prev.x);
+    }
+    if (reason || !cur) {
+      if (reason) bands.push({ x0: prev.x, x1: p.x, reason });
+      cur = { pts: [] };
+      segs.push(cur);
+    }
+    cur.pts.push(p);
+    prev = p;
+  }
+  return { pts, segs, bands };
+}
+
+function drawChart(canvas, tip, series, opts) {
+  const dpr = window.devicePixelRatio || 1;
+  const cssW = canvas.clientWidth || 800;
+  const cssH = 170;
+  canvas.width = Math.round(cssW * dpr);
+  canvas.height = Math.round(cssH * dpr);
+  canvas.style.height = cssH + 'px';
+  const g = canvas.getContext('2d');
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, cssW, cssH);
+
+  const L = 46, R = 10, T = 10, B = 20;
+  const pw = cssW - L - R, ph = cssH - T - B;
+
+  const all = series.pts.filter(p => p[opts.field] !== null && p[opts.field] !== undefined);
+  if (!all.length || !series.pts.length) {
+    g.fillStyle = COL.dim; g.font = '13px ui-monospace,monospace'; g.textAlign = 'center';
+    g.fillText(series.pts.length ? '该指标无有效数据' : '无数据', cssW / 2, cssH / 2);
+    canvas.onmousemove = null;   // 别留着上一次渲染的旧闭包，否则提示框会对错点
+    canvas.onmouseleave = null;
+    return;
+  }
+
+  const xs = series.pts.map(p => p.x);
+  let x0 = Math.min(...xs), x1 = Math.max(...xs);
+  // 把"到现在为止都没有数据"的那段时间也画进来，失联不能被裁掉
+  x1 = Math.max(x1, Math.min(series.now, x1 + UPLOAD_INTERVAL_MS * 60));
+  if (x1 <= x0) x1 = x0 + 1000;
+
+  const vs = all.map(p => p[opts.field]);
+  let lo = Math.min(...vs), hi = Math.max(...vs);
+  const pad = (hi - lo) * 0.15 || 0.1;
+  lo -= pad; hi += pad;
+  if (opts.forceMin !== undefined) lo = Math.min(lo, opts.forceMin);
+  if (opts.forceMax !== undefined) hi = Math.max(hi, opts.forceMax);
+
+  const X = t => L + (t - x0) / (x1 - x0) * pw;
+  const Y = v => T + (hi - v) / (hi - lo) * ph;
+
+  // 网格与刻度
+  g.font = '10px ui-monospace,monospace';
+  g.textAlign = 'right'; g.textBaseline = 'middle';
+  for (let i = 0; i <= 4; i++) {
+    const v = lo + (hi - lo) * i / 4, y = Y(v);
+    g.strokeStyle = COL.grid; g.beginPath();
+    g.moveTo(L, y); g.lineTo(L + pw, y); g.stroke();
+    g.fillStyle = COL.dim;
+    g.fillText(v.toFixed(opts.decimals), L - 6, y);
+  }
+  g.textAlign = 'center'; g.textBaseline = 'top';
+  for (let i = 0; i <= 5; i++) {
+    const t = x0 + (x1 - x0) * i / 5;
+    g.fillStyle = COL.dim;
+    g.fillText(fmtTime(t).slice(0, 8), X(t), T + ph + 5);
+  }
+
+  // 参考线（|a| 的 1 g 是有物理意义的）
+  if (opts.refLine !== undefined && opts.refLine >= lo && opts.refLine <= hi) {
+    g.save(); g.setLineDash([4, 4]); g.strokeStyle = COL.info; g.lineWidth = 1;
+    g.beginPath(); g.moveTo(L, Y(opts.refLine)); g.lineTo(L + pw, Y(opts.refLine)); g.stroke();
+    g.restore();
+  }
+
+  // 丢样/重启竖带 —— 让"数据缺失"在图上占面积，而不是一条线悄悄连过去
+  for (const b of series.bands) {
+    const bx0 = Math.max(X(b.x0), L), bx1 = Math.max(X(b.x1), L);
+    const w = Math.max(bx1 - bx0, 2);
+    g.fillStyle = 'rgba(218,54,51,.22)';
+    g.fillRect(bx0, T, w, ph);
+    g.strokeStyle = 'rgba(218,54,51,.9)'; g.lineWidth = 1;
+    g.beginPath(); g.moveTo(bx0 + w / 2, T); g.lineTo(bx0 + w / 2, T + ph); g.stroke();
+  }
+
+  // 数据之后到现在的空白：设备失联时这段必须可见
+  const lastX = Math.max(...xs);
+  if (series.now - lastX > ONLINE_MS) {
+    const bx = Math.max(X(lastX), L);
+    g.fillStyle = 'rgba(218,54,51,.12)';
+    g.fillRect(bx, T, L + pw - bx, ph);
+    g.fillStyle = 'rgba(255,157,151,.9)'; g.textAlign = 'left'; g.textBaseline = 'top';
+    g.fillText('此后无数据（' + fmtAge(series.now - lastX) + '）', bx + 6, T + 6);
+  }
+
+  // 折线：段内连线，段间绝不连
+  g.lineWidth = 1.4; g.strokeStyle = opts.color;
+  g.lineJoin = 'round'; g.lineCap = 'round';
+  for (const s of series.segs) {
+    let pen = false;
+    g.beginPath();
+    for (const p of s.pts) {
+      const v = p[opts.field];
+      if (v === null || v === undefined) { pen = false; continue; }  // null 断开，不当 0
+      const px = X(p.x), py = Y(v);
+      if (pen) g.lineTo(px, py); else { g.moveTo(px, py); pen = true; }
+    }
+    g.stroke();
+  }
+
+  canvas._geom = { X, Y, x0, x1, series, opts, L, pw, T, ph, cssW, cssH };
+
+  canvas.onmousemove = ev => {
+    const rect = canvas.getBoundingClientRect();
+    const mx = ev.clientX - rect.left;
+    let best = null, bd = Infinity;
+    for (const p of series.pts) {
+      const d = Math.abs(X(p.x) - mx);
+      if (d < bd) { bd = d; best = p; }
+    }
+    if (!best || bd > 12) { tip.style.display = 'none'; return; }
+    tip.innerHTML = opts.tip(best);
+    tip.style.display = 'block';
+    tip.style.left = Math.min(X(best.x) + 12, cssW - 230) + 'px';
+    tip.style.top = (Y(best[opts.field] ?? lo) - 10) + 'px';
+  };
+  canvas.onmouseleave = () => { tip.style.display = 'none'; };
+}
+
+const el = (tag, cls, txt) => {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (txt !== undefined) e.textContent = txt;
+  return e;
+};
+
+function setAlarm(level, title, sub) {
+  const a = $('alarm');
+  a.className = 'a-' + level;
+  a.innerHTML = '';
+  a.appendChild(el('span', null, title));
+  if (sub) a.appendChild(el('span', 'sub', sub));
+}
+
+function renderCards(st, rows, series) {
+  const cards = $('cards');
+  cards.innerHTML = '';
+  const last = st.last_batch;
+  const missing = series.bands.filter(b => b.reason.startsWith('丢样')).length;
+  const missingN = rows.length ? (() => {
+    let n = 0, prev = null;
+    for (const r of rows) {
+      if (prev && prev.boot_id === r.boot_id && r.seq > prev.seq + 1) n += r.seq - prev.seq - 1;
+      prev = r;
+    }
+    return n;
+  })() : 0;
+
+  const defs = [
+    { k:'设备状态', v: last ? (last.age_ms > OFFLINE_MS ? '失联' : last.age_ms > ONLINE_MS ? '延迟' : '在线')
+                            : '无数据',
+      cls: !last ? 'bad' : last.age_ms > OFFLINE_MS ? 'bad'
+                  : last.age_ms > ONLINE_MS ? 'warn' : '' },
+    { k:'最近一批距今', v: last ? fmtAge(last.age_ms) : '—',
+      cls: last && last.age_ms > OFFLINE_MS ? 'bad' : last && last.age_ms > ONLINE_MS ? 'warn' : '' },
+    { k:'窗口内样本', v: rows.length },
+    { k:'窗口内缺口', v: missing + ' 处', u: missingN ? '共丢 ' + missingN + ' 个' : '',
+      cls: missingN ? 'warn' : '' },
+    { k:'板上累计丢弃', v: st.total_dropped, cls: st.total_dropped ? 'warn' : '' },
+    { k:'累计样本', v: st.total_readings },
+    { k:'重启次数', v: st.total_boots, cls: st.total_boots > 1 ? 'warn' : '' },
+    { k:'设备时钟偏差', v: last && last.device_clock_skew_ms !== null
+                              ? (last.device_clock_skew_ms / 1000).toFixed(2) : '—', u:'s' },
+  ];
+  for (const d of defs) {
+    const c = el('div', 'card ' + (d.cls || ''));
+    c.appendChild(el('div', 'k', d.k));
+    const v = el('div', 'v');
+    v.appendChild(document.createTextNode(d.v));
+    if (d.u) v.appendChild(el('span', 'u', d.u));
+    c.appendChild(v);
+    cards.appendChild(c);
+  }
+}
+
+function renderProv(st, rows) {
+  const p = $('prov');
+  p.innerHTML = '';
+  const last = st.last_batch;
+  if (!last) { p.appendChild(el('div', 'note', '尚无任何批次入库。')); return; }
+  const kv = el('div', 'kv');
+  const add = (k, v, cls) => {
+    kv.appendChild(el('div', 'k', k));
+    const d = el('div', 'v');
+    if (cls) { const s = el('span', 'badge ' + cls, v); d.appendChild(s); }
+    else d.textContent = v;
+    kv.appendChild(d);
+  };
+  add('device_mac', last.device_mac);
+  add('来源 IP', last.source_ip || '—');
+  add('boot_id', last.boot_id + '（每次重启变化）');
+  add('固件版本', last.fw_version || '—');
+  add('批内样本数', String(last.n_readings));
+  add('本批上报的板上丢弃', String(last.dropped_since_last));
+  add('服务端接收时刻', fmtTime(last.t_server_recv_ms) + '（权威时间）');
+  add('设备时间（NTP 换算）', last.t_device_ntp_ms ? fmtTime(last.t_device_ntp_ms) : '未提供');
+  add('设备时钟偏差', last.device_clock_skew_ms === null ? '—'
+      : (last.device_clock_skew_ms / 1000).toFixed(3) + ' s（设备 - 服务端）');
+  add('时间戳可信度', TRUST_TEXT[last.t_trust] + '（NTP 同步年龄 '
+      + (last.ntp_sync_age_s === null ? '—' : last.ntp_sync_age_s + ' s') + '）',
+      'b-' + last.t_trust);
+  p.appendChild(kv);
+}
+
+function renderTable(rows) {
+  const tb = $('tbody');
+  tb.innerHTML = '';
+  const view = rows.slice(-400).reverse();
+  let prev = null;
+  for (const r of view) {
+    const tr = el('tr', prev && prev.t_server_recv_ms !== r.t_server_recv_ms ? 'peer' : '');
+    const mag = (r.ax === null || r.ay === null || r.az === null)
+      ? null : Math.hypot(r.ax, r.ay, r.az);
+    const trust = trustOf(r.ntp_synced, r.ntp_sync_age_s);
+    const cells = [
+      [String(r.seq), 'l'], [r.boot_id, 'l'],
+      [fmtTime(r.t_device_ms), ''], [fmtTime(r.t_server_recv_ms), ''],
+      [r.ax === null ? '—' : r.ax.toFixed(3), ''],
+      [r.ay === null ? '—' : r.ay.toFixed(3), ''],
+      [r.az === null ? '—' : r.az.toFixed(3), ''],
+      [mag === null ? '—' : mag.toFixed(3), ''],
+      [r.spl_db === null ? 'null' : r.spl_db.toFixed(1), ''],
+    ];
+    for (const [txt, cls] of cells) tr.appendChild(el('td', cls, txt));
+    const tdT = el('td', 'l');
+    tdT.appendChild(el('span', 'badge b-' + trust, TRUST_TEXT[trust]));
+    tr.appendChild(tdT);
+    tr.appendChild(el('td', 'l', r.source_ip || '—'));
+    tb.appendChild(tr);
+    prev = r;
+  }
+  if (!view.length) {
+    const tr = el('tr');
+    const td = el('td', 'l', '无数据');
+    td.colSpan = 11;
+    tr.appendChild(td);
+    tb.appendChild(tr);
+  }
+}
+
+let inflight = false;
+async function tick() {
+  if (inflight) return;
+  inflight = true;
+  try {
+    const limit = $('limit').value;
+    const [sr, rr] = await Promise.all([
+      fetch('/api/v1/status', { cache:'no-store' }),
+      fetch('/api/v1/readings?limit=' + limit, { cache:'no-store' }),
+    ]);
+    if (!sr.ok || !rr.ok) throw new Error('HTTP ' + sr.status + '/' + rr.status);
+    const st = await sr.json(), rd = await rr.json();
+    const rows = rd.readings || [];
+    const series = buildSeries(rows);
+    series.now = st.server_time_ms;
+
+    renderCards(st, rows, series);
+    renderProv(st, rows);
+    renderTable(rows);
+
+    // SPL 可能整段为 null（麦克风通道没出数），提示框不能假定它一定存在
+    const tipFor = (field, label, unit, dec) => p => {
+      const v = p[field];
+      const head = v === null || v === undefined
+        ? label + '=无有效数据（通道无输出）'
+        : label + '=' + v.toFixed(dec) + ' ' + unit;
+      return 'seq ' + p.raw.seq + '  ' + head + '\n'
+           + fmtTime(p.x) + '\n' + TRUST_TEXT[p.trust] + '  ' + p.raw.boot_id
+           + '  ' + (p.raw.source_ip || '—');
+    };
+    drawChart($('c_acc'), $('tip_acc'), series, {
+      field:'mag', color:COL.ok, decimals:3, refLine:1.0, forceMin:0.5,
+      tip: tipFor('mag', '|a|', 'g', 3),
+    });
+    drawChart($('c_spl'), $('tip_spl'), series, {
+      field:'spl', color:COL.info, decimals:1,
+      tip: tipFor('spl', 'SPL', 'dB', 1),
+    });
+
+    // 报警优先级：先报"根本收不到"，再报"收到了但有缺失"
+    const last = st.last_batch;
+    const missingN = series.bands.reduce((n, b) => {
+      const m = /^丢样 (\d+)/.exec(b.reason);
+      return n + (m ? parseInt(m[1], 10) : 0);
+    }, 0);
+    const recentDrop = last ? last.dropped_since_last : 0;
+
+    if (!rows.length && !last) {
+      setAlarm('crit', '无数据', '服务端从未收到任何批次。检查设备供电、WiFi 与服务端地址。');
+    } else if (!last) {
+      setAlarm('crit', '无数据', '查询窗口内没有任何样本。');
+    } else if (last.age_ms > OFFLINE_MS) {
+      setAlarm('crit', '设备失联 · 已有 ' + fmtAge(last.age_ms) + ' 无数据',
+        '最后一次上传 ' + fmtTime(last.t_server_recv_ms) + '（' + last.device_mac + '）。'
+        + '界面停止更新即代表设备或网络断了，不是"没有事件发生"。');
+    } else if (last.age_ms > ONLINE_MS) {
+      setAlarm('warn', '数据延迟 · 最近一批 ' + fmtAge(last.age_ms) + ' 前',
+        '超过正常上传间隔（' + (UPLOAD_INTERVAL_MS / 1000) + ' 秒）3 倍。');
+    } else if (missingN > 0) {
+      setAlarm('warn', '检测到丢样 · 窗口内共丢失 ' + missingN + ' 个样本',
+        '按 seq 跳号判定，缺口已在图上标成红带。');
+    } else if (recentDrop > 0) {
+      setAlarm('warn', '板上丢弃 ' + recentDrop + ' 个样本',
+        '上传持续失败导致环形缓冲溢出，设备已如实记账。');
+    } else if (st.total_dropped > 0) {
+      setAlarm('warn', '历史累计丢弃 ' + st.total_dropped + ' 个样本', '当前窗口内无新增丢失。');
+    } else {
+      setAlarm('ok', '链路正常', '数据持续到达，无丢弃、无缺口、时间戳可信。');
+    }
+
+    const worst = Object.keys(rd.trust.counts || {});
+    if (worst.length && !worst.every(t => t === 'ntp_fresh')) {
+      const bad = worst.filter(t => t !== 'ntp_fresh')
+        .map(t => TRUST_TEXT[t] + ' ' + rd.trust.counts[t]).join('，');
+      const a = $('alarm');
+      a.appendChild(el('span', 'sub', '⚠ 窗口内存在非新鲜时间戳：' + bad));
+    }
+
+    $('refreshed').textContent = '最近刷新 ' + new Date().toLocaleTimeString('zh-CN', { hour12:false })
+      + '　服务端时间 ' + fmtTime(st.server_time_ms);
+  } catch (e) {
+    // 服务端本身不可达也必须看得见，不能停在旧数据上假装一切正常
+    setAlarm('crit', '无法连接服务端', String(e.message || e));
+  } finally {
+    inflight = false;
+  }
+}
+
+$('limit').addEventListener('change', tick);
+window.addEventListener('resize', tick);
+tick();
+setInterval(tick, UPLOAD_INTERVAL_MS);
+</script>
+</body>
+</html>

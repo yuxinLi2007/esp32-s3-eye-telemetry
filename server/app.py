@@ -5,11 +5,12 @@
 """
 
 import os
+import secrets
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, Query, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -21,9 +22,18 @@ DB_PATH = os.environ.get(
 STATIC_DIR = Path(__file__).parent / "static"
 MAX_READINGS_PER_BATCH = 500
 
+# 入库鉴权。不设则任何能访问到该端口的人都能以任意 MAC、任意时间戳注入数据，
+# "数据来源可追溯"就无从谈起。本地开发可以不设，公网部署必须先设。
+INGEST_TOKEN = os.environ.get("INGEST_TOKEN")
+
 @asynccontextmanager
 async def lifespan(_app):
     db.init_db(DB_PATH).close()
+    if not INGEST_TOKEN:
+        print(
+            "[warn] 未设置 INGEST_TOKEN：/api/v1/ingest 不校验来源，"
+            "任何能访问该端口的人都能以任意 MAC 注入数据。公网部署前必须设置。"
+        )
     yield
 
 
@@ -64,7 +74,18 @@ def health(conn=Depends(get_conn)):
     return {"ok": True, "db": DB_PATH, "server_time_ms": int(time.time() * 1000)}
 
 
-@app.post("/api/v1/ingest", status_code=201)
+def require_ingest_token(request: Request):
+    if not INGEST_TOKEN:
+        return
+    got = request.headers.get("x-ingest-token") or ""
+    # 定时安全比较：逐字节比较会从耗时上泄漏密钥前缀
+    if not secrets.compare_digest(got, INGEST_TOKEN):
+        raise HTTPException(status_code=401, detail="X-Ingest-Token 缺失或不正确")
+
+
+@app.post(
+    "/api/v1/ingest", status_code=201, dependencies=[Depends(require_ingest_token)]
+)
 def ingest(batch: IngestBatch, request: Request, conn=Depends(get_conn)):
     seqs = [r.seq for r in batch.readings]
     # seq 范围由服务端从读数推导，不采信客户端上报的 seq_first/seq_last。

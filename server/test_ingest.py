@@ -189,3 +189,47 @@ def test_trust_level_pure_function():
     assert db.trust_level(True, 301) == "ntp_stale"
     assert db.trust_level(True, 3600) == "ntp_stale"
     assert db.trust_level(True, 3601) == "ntp_expired"
+
+
+# ---- 入库鉴权 ----
+# 没有鉴权时，任何能访问该端口的人都能以任意 MAC 注入数据，"来源可追溯"就是空话。
+
+@pytest.fixture
+def auth_client(tmp_path, monkeypatch):
+    monkeypatch.setattr(app_module, "DB_PATH", str(tmp_path / "auth.db"))
+    monkeypatch.setattr(app_module, "INGEST_TOKEN", "s3cr3t-token")
+    with TestClient(app_module.app) as c:
+        yield c
+
+
+def test_ingest_open_when_token_unset(client, monkeypatch):
+    """未配置令牌时不拦截：本地开发与现有行为保持一致。"""
+    monkeypatch.setattr(app_module, "INGEST_TOKEN", None)
+    assert client.post("/api/v1/ingest", json=batch()).status_code == 201
+
+
+def test_ingest_rejects_missing_token(auth_client):
+    r = auth_client.post("/api/v1/ingest", json=batch())
+    assert r.status_code == 401
+    assert auth_client.get("/api/v1/status").json()["total_readings"] == 0, \
+        "被拒的请求不能留下任何数据"
+
+
+def test_ingest_rejects_wrong_token(auth_client):
+    r = auth_client.post("/api/v1/ingest", json=batch(),
+                         headers={"X-Ingest-Token": "s3cr3t-tokeX"})
+    assert r.status_code == 401
+    assert auth_client.get("/api/v1/status").json()["total_readings"] == 0
+
+
+def test_ingest_accepts_correct_token(auth_client):
+    r = auth_client.post("/api/v1/ingest", json=batch(),
+                         headers={"X-Ingest-Token": "s3cr3t-token"})
+    assert r.status_code == 201
+    assert auth_client.get("/api/v1/status").json()["total_readings"] == 3
+
+
+def test_read_endpoints_stay_public(auth_client):
+    """鉴权只保护写入。读接口公开，否则界面会在浏览器里被拦下。"""
+    assert auth_client.get("/api/v1/readings").status_code == 200
+    assert auth_client.get("/api/v1/status").status_code == 200

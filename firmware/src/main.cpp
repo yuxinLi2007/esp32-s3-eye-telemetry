@@ -186,6 +186,8 @@ static bool upload_batch(uint16_t n) {
     return false;
   }
   http.addHeader("Content-Type", "application/json");
+  // 服务端未配置 INGEST_TOKEN 时不校验，带上也无害；配置了就必须要配对
+  http.addHeader("X-Ingest-Token", INGEST_TOKEN);
   int code = http.POST(payload);
   String body = http.getString();
   http.end();

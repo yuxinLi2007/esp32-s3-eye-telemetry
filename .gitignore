@@ -1,26 +1,38 @@
-# WiFi 凭据 —— 绝不入库
+# ---- 凭据：绝不入库 ----
+# 板端 WiFi 密码、服务端地址、入库令牌都在这里
 firmware/include/secrets.h
 firmware/src/secrets.h
 .env
+*.env
+# 注意：.env.example 不受上面的 *.env 影响（它结尾是 .example），可以正常入库
 
-# Python
-__pycache__/
-*.py[cod]
-.venv/
-venv/
-
-# 数据库
+# ---- 运行期数据 ----
+# 数据库文件按扩展名排掉，目录本身也一起排（避免空目录里再放别的东西）
 *.db
 *.db-journal
 *.db-wal
 *.db-shm
+server/data/
 
-# PlatformIO
+# ---- Python ----
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# ---- PlatformIO 构建产物 ----
 .pio/
 firmware/.pio/
+.pioenvs/
+.piolibdeps/
 
-# 编辑器 / 系统
+# ---- 日志 ----
+*.log
+
+# ---- 编辑器 / 系统 ----
 .vscode/
 .idea/
 .DS_Store
 Thumbs.db
+desktop.ini

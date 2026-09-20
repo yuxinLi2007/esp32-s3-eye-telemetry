@@ -382,7 +382,7 @@ MAC `94:A9:90:1C:6F:D4`）之后，**三条指令没有一条能走到终态**�
 |---|---|
 | 板子离线 26 小时 | 没通电 |
 | `[uplink] 上传失败 HTTP -1` | 防火墙规则 `codex_sandbox_offline_block_inbound` **阻止全部入站**。Windows 里 Block 优先于 Allow，所以先加的 8000 放行规则完全无效 |
-| `pio run` 报缺 `secrets.h` | 该文件被 `.gitignore` 排除，需从 `secrets.example.h` 复制并填 `SERVER_URL` 为**本机局域网 IP**（`172.20.10.12`，不是 `127.0.0.1`） |
+| `pio run` 报缺 `secrets.h` | 该文件被 `.gitignore` 排除，需从 `secrets.example.h` 复制并填 `SERVER_URL` 为**本机局域网 IP**（本机局域网 IP，如 `172.20.10.x`，不是 `127.0.0.1`） |
 
 `HTTP -1` 是"连接被拒"而不是"超时"，这个区别是关键线索：说明包到了主机、
 被主动拒了，方向应该查防火墙而不是查网络连通性。`ping` 板子能通、

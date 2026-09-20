@@ -283,6 +283,196 @@ can only be used in that same thread
 
 ---
 
+## 阶段 12 · 第2周：Web 远程采集指令与执行结果反馈
+
+设计与协议细节单独成文：[`week2-commands.md`](week2-commands.md)。这里只记坑与验证。
+
+**做了什么.** 加一条反方向链路：网页下发指令 → 板子领取并真实采集 → 结果与样本回到网页。
+新增 `server/commands.py`（状态机，唯一一份实现）、`firmware/src/command.*` 与 `uplink.*`、
+`server/static/commands.js`、`server/tools/command_sim.py`；
+`main.cpp` 只加了三处接线（`command_begin` / `command_poll` / 把循环体抽成 `stream_tick`）。
+
+**坑 1 · `io.open(path, "w")` 会先截断再校验参数，把文件写空了.**
+
+写 `index.html` 时脚本报错，但文件已经变成 0 字节——`open(..., "w")` 的截断发生在
+`TextIOWrapper` 校验参数**之前**，异常抛出时破坏已经造成。
+用 `git show HEAD:server/static/index.html` 恢复。
+此后一律**安全写**：写 `.tmp` → `os.replace()`，并且写之前先 `assert s.count(old) == n`
+（找不到锚点就在改动之前失败，而不是改到一半失败）。
+
+**坑 2 · 建库顺序：先 migrate 再 executescript.**
+
+`init_db` 若先跑 `executescript(SCHEMA)`（里面含 `CREATE INDEX ... ON batches(request_id)`），
+对着第1周的旧库就会 `no such column: request_id`——索引建在一个还没被迁移的表上。
+改成先 `migrate(conn)`（幂等地 `ALTER TABLE ADD COLUMN`）再建索引。
+迁移测试也随之改成用**裸 SQL** 模拟第1周写入的行：用新代码去造"旧数据"是自欺欺人。
+
+**坑 3 · 4 个测试失败，其中一个是我原来的设计错了.**
+
+原设计：sweep 发现 `claimed`/`running` 静默超时，一律放回队列重试。
+错在 `running`——设备**已经开始执行**，静默可能只是网络抖动；自动重跑一次采集会得到
+"两批数据对不上号"的更坏结果（两批样本都挂着同一个 request_id，谁也说不清哪批是哪次）。
+改成：`claimed`（领了却从没上报过进度）在重试预算内重排队；`running` 一律直接判 `timeout`，
+让人看见、由人决定是否重发。迁移表里仍保留 `running → pending` 这条边（将来人工重发要用），
+但 `sweep()` 刻意不走。另外两个失败是终态测试没有耗尽重试预算、
+以及 e2e 事件断言没有区分"状态迁移"和"ingest 挂样本的同状态注记"。
+
+**坑 4 · `ui_check.mjs` 的贪婪正则被第二个 `<script>` 打坏.**
+
+页面原本只有一个内联 `<script>`，第2周多了 `<script src="commands.js">`。
+`/<script>([\s\S]*)<\/script>/` 是贪婪的，会把 `</script>\n<script src=...>` 一起吞进"代码"里，
+`new Function` 直接语法错误。改成非贪婪，并给 DOM 桩补上 `classList`、`readyState`、`confirm`，
+以及"createElement 出来的元素赋 id 后要能被 `$` 找回来"（`cmd_p_n`、`cmd_dur` 就是这么造的）。
+
+**坑 5 · 端到端脚本第二次跑，全被当成重复提交.**
+
+`command_sim.py` 第一版把 MAC 和 `client_token` 写死。第二次跑时上一次运行留下的指令还在库里，
+幂等键 `(MAC, op, client_token)` 命中 → 所有下发都返回 200 + `deduped`，
+测出来的是幂等而不是下发；更隐蔽的是上一次留下的 `pending` 会被这一次的假设备**领走**
+（claim 取该 MAC 最早的一条 pending），断言就成了抓阄。
+解决：每次运行生成一个 `RUN` 标识，MAC 与 token 都带上它；并且**每个场景一台设备**。
+
+**坑 6 · 响应头名被压成小写，`hdr.get("X-Deduped")` 取不到.**
+
+服务端发的是 `X-Deduped`，uvicorn 上线时变成 `x-deduped`。
+把 headers 转成 `dict` 之后按原名查就是 `None`。改成保留 `HTTPMessage` 原样返回
+（它的 `.get()` 不区分大小写）——断言要测的是"服务端有没有发这个头"，不是"它用了什么大小写"。
+
+**坑 7 · Windows 控制台 GBK，非 GBK 字符让脚本崩在打印上.**
+
+断言名里写了个 `⚠`，`print` 直接 `UnicodeEncodeError`，整个脚本在 S7 之后中断，
+后面三个 30 秒级场景根本没跑到。开头 `sys.stdout.reconfigure(encoding="utf-8")`，
+并把断言名里的符号换成文字。**测试脚本自己不能因为"报告结果"而失败。**
+
+**坑 8 · 三个 30 秒级场景串行等，脚本要跑一分多钟.**
+
+`timeout_ms`（ping 10 s，重试一次共 20 s）和 `ttl_ms`（30 s）都是真实时间，不能加速——
+加速就等于没测时序。改成**先点火再干别的**：一开始就把三个慢场景下发出去，
+中间跑完 9 个快场景（约 3 秒），最后统一收结果。总时长压到 ~35 秒。
+
+**顺带修掉的一处不诚实.** 第1周加速度读取失败时写的是 `0.000`。
+在图上那是一个**看起来合法的读数**（合矢量 0，等于"设备在自由落体"），比报错更难发现。
+现在写 NaN，JSON 序列化成 `null`，前端按"缺这一点"处理。连续流与指令流都适用。
+
+**验证结果.**
+
+| 检查项 | 结果 |
+|---|---|
+| `pytest test_commands.py test_ingest.py -q` | **104 passed**（第1周 27 + 第2周 80，无回归） |
+| `tools/command_sim.py`（真实 HTTP，12 类故障注入） | **162 断言全通过**，退出码 0，约 35 秒 |
+| `tools/ui_check.mjs`（第1周检查） | 报警等级 `a-crit`、缺口带 `lost 丢样 7 个`、`trust.counts` 与第1周一致 |
+| `tools/ui_check.mjs`（第2周防抖断言） | 连点 3 次 ping → `POST /api/v1/commands` **恰好 1 次** |
+| 前端参数范围 | 按钮与 `input.min/max` 全部来自 `/commands/ops`（`n 1..200`、`interval 10..1000`） |
+| `pio run` | 编译通过，RAM **17.6%** / Flash **27.6%** |
+| 慢场景实测时序 | 领取后静默 10 s → `pending`(requeues=1) → 再领(attempts=2) → 再静默 10 s → `timeout`；执行中静默 10 s → `timeout`(requeues=0)；离线 30 s → `expired`(attempts=0) |
+
+---
+
+## 阶段13：真机联调——仿真全绿，板子上一条指令都跑不完
+
+第2周交付时 104 个单测、162 条仿真断言、UI 检查全绿。插上真板子（COM5，
+MAC `94:A9:90:1C:6F:D4`）之后，**三条指令没有一条能走到终态**。这一节记的是
+"为什么全绿的测试挡不住这三个 bug"，比 bug 本身更值得记。
+
+### 先解决环境问题，才看得见代码问题
+
+板子上电后网页依然没有数据，排查顺序是：
+
+| 现象 | 真因 |
+|---|---|
+| 板子离线 26 小时 | 没通电 |
+| `[uplink] 上传失败 HTTP -1` | 防火墙规则 `codex_sandbox_offline_block_inbound` **阻止全部入站**。Windows 里 Block 优先于 Allow，所以先加的 8000 放行规则完全无效 |
+| `pio run` 报缺 `secrets.h` | 该文件被 `.gitignore` 排除，需从 `secrets.example.h` 复制并填 `SERVER_URL` 为**本机局域网 IP**（`172.20.10.12`，不是 `127.0.0.1`） |
+
+`HTTP -1` 是"连接被拒"而不是"超时"，这个区别是关键线索：说明包到了主机、
+被主动拒了，方向应该查防火墙而不是查网络连通性。`ping` 板子能通、
+`arp -a` 能解析到正确 MAC，进一步确认了 L2/L3 没问题。
+
+### Bug 1：领取应答的空参数段被判非法（固件）
+
+`split_claim` 里有一句 `for (i<4) if (!parts[i].length()) return false;`。
+但 `ping`/`selftest` 本来就没有参数，服务端发的是 `rid|op||timeout`，
+第 3 段**合法为空**。结果这两条指令永远解析失败。
+
+**为什么测试没发现**：仿真器用的是服务端自己的 `decode_claim`——等于服务端
+自己验自己，线格式和固件不一致时根本看不出来。修法是在仿真器里加一份
+**逐行复刻固件 `split_claim`** 的严格解析器，每次领取先过一遍。
+两侧的口径必须有一份是"照着对面写的"，否则契约就是空的。
+
+### Bug 2：手拼 JSON 开头多一个逗号（固件）
+
+`add_num` / `add_str` 等 helper 一律"先补逗号再写键"，而调用方是这样开头的：
+
+```cpp
+r += "{";
+add_u32(r, "uptime_s", ...);   // →  {,"uptime_s":...   非法 JSON
+```
+
+于是所有 `done` 回执被服务端 422 拒掉。修在 helper 里（加 `jsep()`，
+只在"已有内容且不以 `{` 结尾"时补逗号），而不是改十几个调用点——
+调用点漏一处就是同样的静默失败。
+
+**为什么测试没发现**：固件侧没有任何单测，手拼 JSON 的正确性从未被验证过。
+仿真器发的是 Python `json.dumps` 的结果，永远是合法的。
+
+### Bug 3：终态回执失败后，设备把整条采集重跑（固件 + 服务端设计缺口）
+
+这是三个里最坏的。领取接口对同一次启动是**幂等**的：设备再来领，服务端把
+同一条原样还回来（连 `running` 状态的也还）。而固件把"领到了"一律当成
+"有新活干"，于是：
+
+```
+done 回执 422 失败 → 2 秒后幂等重领到同一条 → 从头再跑一遍 capture
+   → 又发一轮 progress → 刷新服务端的静默计时 → 永远不会 timeout
+   → 下一条指令永远排不上
+```
+
+一条 `capture` 卡了 **16 分钟**，攒了 600 多条 `running -> running` 事件，
+后面所有新指令全部 `expired`。
+
+两个教训：
+- **终态回执失败必须靠"重发回执"兜底，绝不能靠"重跑一遍"兜底。**
+  现在固件缓存失败的终态回执，后续周期补发，最多 5 次，放弃后明确打日志、
+  交给服务端判 timeout；同时记住"已执行过的 request_id"，幂等重领时直接跳过。
+- **以"静默"为唯一超时条件是有洞的**：只要设备还在发 progress，
+  RUNNING 就能无限续命。目前靠固件不再重跑来堵，但服务端侧缺一个
+  "绝对上限"兜底（见下）。
+
+### 顺带发现：`request_id` 唯一性测试本身是抖的
+
+`pytest` 跑全量时 `test_request_id_unique_within_same_millisecond` 红了：
+5000 个 id 里有 1 个重复。这不是偶然——随机片只有 3 字节（24 位），
+同一毫秒内抽 5000 次，按生日悖论期望碰撞 ≈ 0.75 次，
+**这条测试大约一半概率会失败**。改成记住当前毫秒已发过的后缀、撞了就重抽
+（后缀仍全部来自 `secrets`，不掺计数器，保住不可预测性），连跑 5 次全绿。
+
+> 一条"偶尔红"的测试比没有测试更糟：它会训练人去忽略红色。
+
+### 真机最终结果
+
+| 指令 | 状态 | 排队 | 执行 | 结果 |
+|---|---|---|---|---|
+| `ping` | **done** | 353 ms | 448 ms | RSSI −36 dBm、free_heap 271600、ring 21/240、uptime、fw 0.2.0 |
+| `capture` n=20 interval=50 | **done** | 1378 ms | 1980 ms | 设备自报 20 / 入库 20，**一致**，batch 5339 |
+| `selftest` | **failed** | 1220 ms | 475 ms | `accel_out_of_range`：\|a\|=1.673（期望 1.0±0.15） |
+
+`selftest` 的失败是**传感器的真实状态，不是代码 bug**：连续采集流里
+`ax≈−1.04, ay≈−1.17, az≈+0.59`，`|a|` 同样恒为 ≈1.67，三轴都有明显偏置。
+这是第1周就存在的加速度计未校准问题，自检如实报了出来，
+并且失败通道（`error_code` / `error_message` / `result`）全程工作正常。
+
+### 验证
+
+| 命令 | 结果 |
+|---|---|
+| `pytest -q`（全量） | **105 passed**（新增 1 条线格式契约测试），连跑 5 次无抖动 |
+| `tools/command_sim.py` | **162 断言全通过**，且每次领取都过固件口径的严格校验 |
+| `tools/ui_check.mjs` | 第1周检查无回归；连点 3 次 → **1 次 POST**；面板显示真实终态（成功 2 / 设备报错 1 / 超时 7） |
+| `pio run -t upload` | 烧录成功，RAM 17.6% / Flash 27.7% |
+| 真机端到端 | ping / selftest / capture 三条全部走到终态，结果与设备实际状态一致 |
+
+---
+
 ## 横向：三条一直用到的判断准则
 
 ### 1. 同一个事实不要存两处
@@ -346,3 +536,22 @@ can only be used in that same thread
   界面刻意不用它，但接口仍然敞着——是个陷阱。
 - **`control_log` 无清理机制**，低频操作下不是问题。
 - **VPS 部署尚未实测**，README 中给出的是待验证方案。
+- **指令是串行执行的**：一条 `capture` 在跑时后面的只能排队。要并发就得在板端加任务与互斥，
+  代价是环形缓冲争用。
+- **指令状态靠 2 秒轮询**，没有 WebSocket/SSE；`to_dict` 每次都重算派生字段，
+  指令条数多了之后响应体会变大。
+- **`sweep()` 是全表扫 live 行**。在飞上限 8/设备，规模小无所谓；设备上百台时要改成
+  "按 deadline 排序取前 N 行"。
+- **`CONTROL_TOKEN` 存在 localStorage**，XSS 下会被读走。
+- **`capture` 10 秒上限与 12 秒环形缓冲的耦合只有注释和文档守着**，没有测试。
+  改 `RING_CAPACITY` 或采样率时容易忘。
+- **指令面板需要手填目标 MAC**（服务端会预填最近一批的），没有设备列表可选。
+- **`running` 状态不许撤销**：只有 `pending` 能 cancel。真机联调时一条卡在
+  `running` 的指令无法人工终结，只能等它静默超时；而它又占着"同 boot_id 幂等重领"
+  的位置，会把该设备后续所有指令堵成 `expired`。缺一个操作员强制终结的口子。
+- **RUNNING 缺绝对超时上限**：deadline 只看"最后一次有动静"，设备只要持续发
+  progress 就能无限续命。目前靠固件不再重跑来规避，服务端侧没有兜底。
+- **固件侧零单测**：`split_claim` 与手拼 JSON 这两个 bug 都出在纯函数上，
+  本来最容易在 PC 上测（host-based unit test），却只能靠真机暴露。
+- **加速度计三轴偏置未校准**：静止时 |a|≈1.67 而非 1.0，`selftest` 恒判
+  `accel_out_of_range`。第1周遗留，需要在 `sensors.cpp` 加零偏标定。

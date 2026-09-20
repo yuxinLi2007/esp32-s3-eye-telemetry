@@ -31,7 +31,11 @@ CREATE TABLE IF NOT EXISTS batches (
     t_device_ntp_ms    INTEGER,
     t_server_recv_ms   INTEGER NOT NULL,
     source_ip          TEXT,
-    source_ua          TEXT
+    source_ua          TEXT,
+    -- 第2周：非空表示这批样本是某条远程指令采的，而不是连续流的一部分。
+    -- 两个流的 seq 各自独立计数，混在一起算缺口会把指令采集误报成丢样，
+    -- 所以这个字段同时是 query_readings / find_gaps 的分流依据。
+    request_id         TEXT
 );
 
 CREATE TABLE IF NOT EXISTS readings (
@@ -50,6 +54,7 @@ CREATE TABLE IF NOT EXISTS readings (
 CREATE INDEX IF NOT EXISTS idx_readings_seq     ON readings (boot_id, seq);
 CREATE INDEX IF NOT EXISTS idx_readings_batch   ON readings (batch_id);
 CREATE INDEX IF NOT EXISTS idx_batches_recv     ON batches (t_server_recv_ms);
+CREATE INDEX IF NOT EXISTS idx_batches_request  ON batches (request_id);
 
 -- 采集开关的变更历史。当前状态 = 最后一条，不另设单行表——
 -- 同一个事实存两处必然会漂移（和 trust_level 不落库是同一个道理）。
@@ -76,8 +81,31 @@ def connect(path):
     return conn
 
 
+def migrate(conn):
+    """给第1周留下的旧库补列。
+
+    CREATE TABLE IF NOT EXISTS 对已存在的表什么也不做，所以新增列必须显式 ALTER。
+    加列而不是重建表：旧数据一行不动，request_id 为 NULL 就是"连续流样本"，
+    语义天然正确，不需要回填。
+    """
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(batches)")}
+    if not cols:
+        return conn            # 全新的库：还没有表，交给 SCHEMA 直接建对
+    if "request_id" not in cols:
+        conn.execute("ALTER TABLE batches ADD COLUMN request_id TEXT")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_batches_request ON batches (request_id)"
+        )
+        conn.commit()
+    return conn
+
+
 def init_db(path):
     conn = connect(path)
+    # 顺序不能反：SCHEMA 里有 CREATE INDEX ... ON batches(request_id)，
+    # 旧库还没这一列时先建索引会直接 OperationalError，服务起不来。
+    # 先 migrate 补列（表不存在时是空操作），再建表建索引。
+    migrate(conn)
     conn.executescript(SCHEMA)
     conn.commit()
     return conn
@@ -104,8 +132,8 @@ def insert_batch(conn, meta):
         """INSERT INTO batches
            (device_mac, boot_id, fw_version, seq_first, seq_last, n_readings,
             dropped_since_last, ntp_synced, ntp_sync_age_s, t_device_ntp_ms,
-            t_server_recv_ms, source_ip, source_ua)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            t_server_recv_ms, source_ip, source_ua, request_id)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             meta["device_mac"],
             meta["boot_id"],
@@ -120,6 +148,7 @@ def insert_batch(conn, meta):
             meta["t_server_recv_ms"],
             meta.get("source_ip"),
             meta.get("source_ua"),
+            meta.get("request_id"),
         ),
     )
     batch_id = cur.lastrowid
@@ -146,7 +175,16 @@ def insert_batch(conn, meta):
     return batch_id
 
 
-def query_readings(conn, since_ms=None, limit=2000, device_mac=None):
+def query_readings(conn, since_ms=None, limit=2000, device_mac=None,
+                   request_id=None, include_command_samples=False):
+    """查询样本。
+
+    默认只返回连续流（request_id IS NULL）：指令采集是一次性的独立数据流，
+    混进连续流会让第1周的曲线出现假缺口、假重启。
+    要单独看某条指令采到的样本，传 request_id；要全都要，传
+    include_command_samples=True。被排除的数量由 count_command_samples 另行报出，
+    所以"默认不返回"不等于"悄悄藏起来"。
+    """
     where, params = [], []
     if since_ms is not None:
         where.append("r.t_device_ms >= ?")
@@ -154,6 +192,11 @@ def query_readings(conn, since_ms=None, limit=2000, device_mac=None):
     if device_mac:
         where.append("r.device_mac = ?")
         params.append(device_mac)
+    if request_id:
+        where.append("b.request_id = ?")
+        params.append(request_id)
+    elif not include_command_samples:
+        where.append("b.request_id IS NULL")
     clause = ("WHERE " + " AND ".join(where)) if where else ""
     params.append(limit)
 
@@ -161,13 +204,23 @@ def query_readings(conn, since_ms=None, limit=2000, device_mac=None):
         f"""SELECT r.id, r.device_mac, r.boot_id, r.seq, r.t_device_ms,
                    r.ax, r.ay, r.az, r.spl_db,
                    b.t_server_recv_ms, b.ntp_synced, b.ntp_sync_age_s,
-                   b.t_device_ntp_ms, b.dropped_since_last, b.source_ip
+                   b.t_device_ntp_ms, b.dropped_since_last, b.source_ip,
+                   b.request_id
             FROM readings r JOIN batches b ON b.id = r.batch_id
             {clause}
             ORDER BY r.id DESC LIMIT ?""",
         params,
     ).fetchall()
     return [dict(r) for r in reversed(rows)]
+
+
+def count_command_samples(conn):
+    """指令采集样本的总数。界面上要显示这个数，否则"默认过滤"就变成了看不见的丢弃。"""
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM readings r JOIN batches b ON b.id = r.batch_id"
+        " WHERE b.request_id IS NOT NULL"
+    ).fetchone()
+    return row["n"] if row else 0
 
 
 def trust_counts(readings):
@@ -190,8 +243,14 @@ def find_gaps(readings):
     """
     gaps = []
     prev = None
+    # 流标识 = boot_id + request_id。指令采集的 seq 是它自己那一轮从 0 开始数的，
+    # 和连续流的 seq 没有可比性；不分开算就会把"一次指令采集"报成"丢了几百个样本"。
+    def stream_of(r):
+        rid = r["request_id"] if "request_id" in r.keys() else None
+        return r["boot_id"] if rid is None else r["boot_id"] + "#" + rid
+
     for r in readings:
-        if prev is not None and prev["boot_id"] == r["boot_id"]:
+        if prev is not None and stream_of(prev) == stream_of(r):
             expected = prev["seq"] + 1
             if r["seq"] > expected:
                 gaps.append(

@@ -81,6 +81,36 @@
   .tip { position:absolute; pointer-events:none; background:#1c2229; border:1px solid var(--line);
          border-radius:6px; padding:6px 8px; font-size:11px; display:none; z-index:5;
          white-space:pre; }
+
+  /* ---- 第2周：远程指令面板 ---- */
+  .cmdrow { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:8px; }
+  .cmdrow label { color:var(--dim); }
+  input[type=text], input[type=number] { background:#0d1116; color:var(--fg);
+      border:1px solid var(--line); border-radius:6px; padding:4px 8px; font:inherit; }
+  input[type=text] { width:170px; }
+  input[type=number] { width:86px; }
+  .btn.op { border-color:var(--info); color:#79c0ff; }
+  .btn.danger { border-color:var(--crit); color:#ff9d97; }
+  .b-pending   { background:#3a2d08; color:#f0c674; }
+  .b-claimed,
+  .b-running   { background:#0d2137; color:#79c0ff; }
+  .b-done      { background:#0d2a17; color:#7ee787; }
+  .b-failed,
+  .b-timeout   { background:#4a1512; color:#ff9d97; }
+  .b-expired   { background:#3d2408; color:#ffa657; }
+  .b-cancelled { background:#21262d; color:#8b949e; }
+  .bar { position:relative; height:6px; width:70px; background:#21262d;
+         border-radius:3px; overflow:hidden; }
+  .bar > i { display:block; height:100%; background:var(--info); }
+  .cmd-detail { background:var(--panel); border:1px solid var(--line); border-radius:8px;
+                padding:12px; margin-top:12px; }
+  .cmd-detail h3 { margin:14px 0 6px; }
+  .tl { list-style:none; margin:0; padding:0; font-size:11px; color:var(--dim); }
+  .tl li { padding:3px 0; border-bottom:1px dotted #21262d; }
+  .tl b { color:var(--fg); font-weight:600; }
+  pre.json { margin:0; padding:8px; background:#0d1116; border:1px solid var(--line);
+             border-radius:6px; overflow:auto; max-height:240px; font-size:11px; }
+  td.mismatch { color:var(--warn); font-weight:600; }
 </style>
 </head>
 <body>
@@ -105,6 +135,44 @@
   <section>
     <h3>数据来源（最近一批）</h3>
     <div class="prov" id="prov"></div>
+  </section>
+
+  <section>
+    <h3>远程采集指令（第2周）</h3>
+    <div class="prov">
+      <div class="cmdrow">
+        <label>目标设备 MAC</label>
+        <input type="text" id="cmd_mac" spellcheck="false" placeholder="AA:BB:CC:DD:EE:FF">
+        <span class="note" id="cmd_mac_hint"></span>
+        <label>备注</label>
+        <input type="text" id="cmd_note_text" style="width:220px" maxlength="200"
+               placeholder="选填，会显示在指令详情里">
+      </div>
+      <!-- 按钮与参数输入框由 commands.js 按 /api/v1/commands/ops 渲染：
+           参数范围只有服务端一份，前端不另抄，改一边忘一边是迟早的事 -->
+      <div class="cmdrow" id="cmd_ops"></div>
+      <div class="cmdrow">
+        <span class="note" id="cmd_stats"></span>
+        <button class="btn" id="cmd_refresh">立即刷新</button>
+      </div>
+      <div class="note" id="cmd_note"></div>
+    </div>
+    <div class="tablewrap" style="margin-top:10px">
+      <table>
+        <thead><tr>
+          <th class="l">request_id</th><th class="l">指令</th><th class="l">状态</th>
+          <th class="l">进度</th><th>耗时</th><th>样本 服务端/设备</th>
+          <th class="l">结果 / 失败原因</th><th class="l">操作</th>
+        </tr></thead>
+        <tbody id="cmd_tbody"></tbody>
+      </table>
+    </div>
+    <div id="cmd_detail"></div>
+    <div class="note">
+      指令采集到的样本不会混进上面的连续流图表：服务端按 request_id 把两条流分开存、
+      分开算缺口。要看某条指令采到了什么，点它的「详情」。
+      超时不靠后台线程判：页面每 2 秒轮询一次，服务端在被读到的那一刻结算。
+    </div>
   </section>
 
   <section>
@@ -709,6 +777,18 @@ setInterval(tick, UPLOAD_INTERVAL_MS);
 // 页面用 file:// 打开时要连的是哪台服务端，只有打开的人知道。
 // 把当前实际用的地址摆出来，省得"没数据"的时候要靠猜。
 if (API) document.title = 'ESP32-S3-EYE 遥测 · ' + API;
+
+// 交给 commands.js 复用。ctlToken 用 getter 暴露：它是一个会被 401 流程改写的
+// 局部变量，直接赋值副本的话，两个面板会各自持有一份令牌，很快就对不上。
+window.DASH = {
+  $, api, el, setAlarm, fmtTime, fmtAge, COL, trustOf, TRUST_TEXT, ctlHeaders,
+  get ctlToken() { return ctlToken; },
+  setCtlToken(t) {
+    ctlToken = t;
+    try { localStorage.setItem('ctl_token', t); } catch (e) {}
+  },
+};
 </script>
+<script src="commands.js"></script>
 </body>
 </html>

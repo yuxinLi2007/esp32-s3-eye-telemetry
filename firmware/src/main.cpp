@@ -8,6 +8,11 @@
 //   - NTP 状态：上报是否同步过、同步了多久，让服务端能判断设备时间可不可信
 //   - 持续采样 => 数据流本身就是心跳。界面安静即代表设备失联，
 //     而不是"没有事件发生"
+//
+// 第2周新增：Web 远程采集指令。实现全部在 command.cpp / uplink.cpp 里，
+// 本文件只做三件接线的事：把设备身份与状态"现场取值"的回调交出去、
+// 把连续流节拍抽成 stream_tick() 供指令执行期间复用、在 loop 里调 command_poll()。
+// 之所以不让指令模块自己持有一份状态副本：同一个事实存两处必然漂移。
 
 #include <Arduino.h>
 #include <HTTPClient.h>
@@ -16,9 +21,11 @@
 #include <esp_sntp.h>
 #include <time.h>
 
+#include "command.h"   // 第2周：远程指令的领取与执行（独立模块，本文件只接线）
 #include "config.h"
 #include "secrets.h"
 #include "sensors.h"
+#include "uplink.h"    // HTTP 上行统一出口（ingest / claim / result 共用一份超时与令牌）
 
 static const uint32_t NTP_VALID_EPOCH = 1600000000UL; // 2020-09-13，早于此视为未同步
 
@@ -156,79 +163,97 @@ static void control_poll() {
   http.end();
 }
 
-static String build_payload(uint16_t n) {
-  String j;
-  j.reserve(256 + n * 110);
-  uint64_t tdev = 0;
-  bool has_dev_time = device_time_ms(&tdev);
-
-  j += "{\"device_mac\":\"";
-  j += g_mac;
-  j += "\",\"boot_id\":\"";
-  j += g_boot_id;
-  j += "\",\"fw_version\":\"" FW_VERSION "\"";
-  j += ",\"ntp_synced\":";
-  j += g_ntp_synced ? "true" : "false";
-  j += ",\"ntp_sync_age_s\":";
-  j += g_ntp_synced ? String(ntp_age_s()) : "null";
-  j += ",\"t_device_ntp_ms\":";
-  if (has_dev_time) {
-    // epoch 毫秒约 1.79e12，必须按 64 位格式化；转成 unsigned long(32位) 会截断
-    char tbuf[24];
-    snprintf(tbuf, sizeof(tbuf), "%llu", (unsigned long long)tdev);
-    j += tbuf;
-  } else {
-    j += "null";
-  }
-  j += ",\"dropped_since_last\":";
-  j += String(g_dropped_since_last);
-  j += ",\"readings\":[";
-
-  for (uint16_t i = 0; i < n; i++) {
-    const Sample &s = g_ring[(g_head + i) % RING_CAPACITY];
-    if (i) j += ",";
-    char buf[128];
-    char spl[16];
-    if (isnan(s.spl_db))
-      snprintf(spl, sizeof(spl), "null");
-    else
-      snprintf(spl, sizeof(spl), "%.1f", s.spl_db);
-    snprintf(buf, sizeof(buf),
-             "{\"seq\":%lu,\"t_device_ms\":%lu,\"ax\":%.3f,\"ay\":%.3f,"
-             "\"az\":%.3f,\"spl_db\":%s}",
-             (unsigned long)s.seq, (unsigned long)s.t_device_ms, s.ax, s.ay,
-             s.az, spl);
-    j += buf;
-  }
-  j += "]}";
-  return j;
+static DeviceId device_id() {
+  DeviceId id = {g_mac, g_boot_id, FW_VERSION};
+  return id;
 }
+
+static BatchMeta stream_meta() {
+  BatchMeta m = {};
+  m.ntp_synced = g_ntp_synced;
+  m.ntp_age_s = ntp_age_s();
+  m.has_device_time = device_time_ms(&m.t_device_ntp_ms);
+  m.dropped_since_last = g_dropped_since_last;
+  m.request_id = nullptr;   // nullptr = 连续流样本；指令采集的样本由 command.cpp 带上 request_id
+  return m;
+}
+
+// uplink 只接受连续数组，而环形缓冲会绕回，所以先拷出来。
+// 放 static：100 * 24B = 2.4KB，压在 loop 任务的栈上不划算。
+static Sample g_batch_buf[MAX_BATCH];
 
 // 返回 true 表示服务端已确认收下这批数据
 static bool upload_batch(uint16_t n) {
-  if (WiFi.status() != WL_CONNECTED) return false;
+  if (n == 0) return false;
+  if (n > MAX_BATCH) n = MAX_BATCH;
+  for (uint16_t i = 0; i < n; i++)
+    g_batch_buf[i] = g_ring[(g_head + i) % RING_CAPACITY];
+  return uplink_ingest(device_id(), stream_meta(), g_batch_buf, n);
+}
 
-  String payload = build_payload(n);
-  HTTPClient http;
-  http.setTimeout(5000);
-  http.setConnectTimeout(3000);
-  String url = String(SERVER_URL) + "/api/v1/ingest";
-  if (!http.begin(url)) {
-    Serial.println("[uplink] http.begin 失败");
-    return false;
-  }
-  http.addHeader("Content-Type", "application/json");
-  // 服务端未配置 INGEST_TOKEN 时不校验，带上也无害；配置了就必须要配对
-  http.addHeader("X-Ingest-Token", INGEST_TOKEN);
-  int code = http.POST(payload);
-  String body = http.getString();
-  http.end();
+// 指令模块要的"设备此刻的样子"。全部现场取值，不在那边存副本。
+static void fill_snapshot(DeviceSnapshot *out) {
+  out->mac = g_mac;
+  out->boot_id = g_boot_id;
+  out->fw_version = FW_VERSION;
+  out->ntp_synced = g_ntp_synced;
+  out->ntp_age_s = ntp_age_s();
+  out->has_device_time = device_time_ms(&out->t_device_ntp_ms);
+  out->dropped_since_last = g_dropped_since_last;
+  out->stream_seq = g_seq;
+  out->ring_count = g_count;
+  out->ring_capacity = RING_CAPACITY;
+  out->collect_enabled = g_collect;
+}
 
-  if (code != 201) {
-    Serial.printf("[uplink] 上传失败 HTTP %d  样本=%u\n", code, n);
-    return false;
+// 一次"连续流"节拍：采样与上传各有自己的时间闸门，不到点就什么都不做。
+//
+// 抽成函数是第2周的需要：远程 capture 最长要跑 10 秒，那段时间如果主循环
+// 被独占，连续流就会出现一个 10 秒的断层，界面上画成红色"上传中断"竖带——
+// 把用户自己点的按钮显示成设备故障。所以指令执行期间会回调这里。
+static void stream_tick() {
+  uint32_t now = millis();
+  static uint32_t last_sample = 0;
+  static uint32_t last_upload = 0;
+
+  // 停止采集只停"采样"，不停"上传"：缓冲区里已经采到的样本要照常传完。
+  // 按一次停止就丢掉手上已有数据，等于让用户的操作毁掉数据。
+  if (g_collect && now - last_sample >= SAMPLE_INTERVAL_MS) {
+    last_sample = now;
+    Sample s = {};
+    s.seq = g_seq++;
+    s.t_device_ms = now;
+    float spl = NAN;
+    bool accel_ok = accel_read(&s.ax, &s.ay, &s.az);
+    // 读不到就写 NaN（入库为 null），不要留下 0.000：
+    // 0 g 是物理上说得通的值，混进数据里没人能发现，这是最坏的失败方式。
+    if (!accel_ok) s.ax = s.ay = s.az = NAN;
+    bool mic_ok = mic_read_spl(&spl);
+    s.spl_db = spl;
+    if (accel_ok || mic_ok) {
+      ring_push(s);
+    } else {
+      g_dropped_since_last++;
+    }
   }
-  return true;
+
+  if (now - last_upload >= UPLOAD_INTERVAL_MS) {
+    last_upload = now;
+    uint16_t n = g_count > MAX_BATCH ? MAX_BATCH : g_count;
+    if (n > 0) {
+      if (upload_batch(n)) {
+        Serial.printf("[uplink] OK 样本=%u 剩余=%u 本次丢=%lu 累计丢=%lu\n", n,
+                      g_count - n, (unsigned long)g_dropped_since_last,
+                      (unsigned long)g_dropped_lifetime);
+        g_dropped_lifetime += g_dropped_since_last;
+        g_prefs.putULong("dropped", g_dropped_lifetime);
+        g_dropped_since_last = 0;
+        ring_drop_front(n);
+      } else if (g_count >= RING_CAPACITY) {
+        Serial.println("[uplink] 持续失败，缓冲已满开始丢弃");
+      }
+    }
+  }
 }
 
 void setup() {
@@ -268,56 +293,24 @@ void setup() {
   if (!sensors_begin()) {
     Serial.println("[sensors] 有传感器不可用，仍将继续运行并上报可用的那部分");
   }
+
+  // 第2周接线：把"现场取值"和"连续流节拍"两个回调交给指令模块。
+  // 放在 sensors_begin 之后：自检/采集要用的传感器此时才真正就绪。
+  command_begin(fill_snapshot, stream_tick);
   Serial.printf("[cfg] 服务端=%s  采样=%dms  上传=%dms\n", SERVER_URL,
                 SAMPLE_INTERVAL_MS, UPLOAD_INTERVAL_MS);
   Serial.println("===== 开始采集 =====\n");
 }
 
 void loop() {
-  uint32_t now = millis();
-
   wifi_ensure();
   if (WiFi.status() == WL_CONNECTED) {
     ntp_ensure();
     control_poll();
+    // 第2周：领取并执行一条远程指令（内部按 COMMAND_POLL_MS 节流）。
+    // 一次只领一条、执行完再领下一条：板上不存指令队列，
+    // 掉线重启后由服务端按超时重新入队或判超时，避免两个事实来源。
+    command_poll();
   }
-
-  static uint32_t last_sample = 0;
-  static uint32_t last_upload = 0;
-
-  // 停止采集只停"采样"，不停"上传"：缓冲区里已经采到的样本要照常传完。
-  // 按一次停止就丢掉手上已有数据，等于让用户的操作毁掉数据。
-  if (g_collect && now - last_sample >= SAMPLE_INTERVAL_MS) {
-    last_sample = now;
-    Sample s = {};
-    s.seq = g_seq++;
-    s.t_device_ms = now;
-    float spl = NAN;
-    bool accel_ok = accel_read(&s.ax, &s.ay, &s.az);
-    bool mic_ok = mic_read_spl(&spl);
-    s.spl_db = spl;
-    if (accel_ok || mic_ok) {
-      ring_push(s);
-    } else {
-      g_dropped_since_last++;
-    }
-  }
-
-  if (now - last_upload >= UPLOAD_INTERVAL_MS) {
-    last_upload = now;
-    uint16_t n = g_count > MAX_BATCH ? MAX_BATCH : g_count;
-    if (n > 0) {
-      if (upload_batch(n)) {
-        Serial.printf("[uplink] OK 样本=%u 剩余=%u 本次丢=%lu 累计丢=%lu\n", n,
-                      g_count - n, (unsigned long)g_dropped_since_last,
-                      (unsigned long)g_dropped_lifetime);
-        g_dropped_lifetime += g_dropped_since_last;
-        g_prefs.putULong("dropped", g_dropped_lifetime);
-        g_dropped_since_last = 0;
-        ring_drop_front(n);
-      } else if (g_count >= RING_CAPACITY) {
-        Serial.printf("[uplink] 持续失败，缓冲已满开始丢弃\n");
-      }
-    }
-  }
+  stream_tick();
 }

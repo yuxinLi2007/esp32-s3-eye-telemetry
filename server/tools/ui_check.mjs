@@ -13,7 +13,7 @@ const argOrigin = (() => {
 })();
 
 const HTML = new URL('../static/index.html', import.meta.url);
-const code = fs.readFileSync(HTML, 'utf8').match(/<script>([\s\S]*)<\/script>/)[1];
+const code = fs.readFileSync(HTML, 'utf8').match(/<script>([\s\S]*?)<\/script>/)[1];
 
 const draw = [];
 const rec = n => (...a) => draw.push([n, ...a]);
@@ -30,6 +30,15 @@ const makeCtx = () => ({
 const els = new Map();
 const makeEl = (tag = 'div') => ({
   tagName: tag, children: [], _text: '', className: '', style: {}, colSpan: 0,
+  // classList：commands.js 用它标 mismatch/bad。桩里只记类名，够断言用。
+  classList: { _s: new Set(), add(c) { this._s.add(c); }, remove(c) { this._s.delete(c); },
+               contains(c) { return this._s.has(c); },
+               toString() { return [...this._s].join(' '); } },
+  onclick: null, min: null, max: null, type: '', title: '', disabled: false,
+  // createElement 出来再赋 id 的元素，要能被 $ 找回来（cmd_p_n / cmd_dur 就是这么造的）。
+  // 覆盖而不是"没有才登记"：登记在后的那个才是真正在页面上的。
+  get id() { return this._id || ''; },
+  set id(v) { this._id = v; if (v) els.set(v, this); },
   get textContent() { return this._text; },
   set textContent(v) { this._text = String(v); },
   set innerHTML(v) { if (v === '') this.children = []; },
@@ -45,9 +54,16 @@ globalThis.document = {
   getElementById(id) { if (!els.has(id)) els.set(id, makeEl()); return els.get(id); },
   createElement: t => makeEl(t),
   createTextNode: t => ({ children: [], textContent: String(t), appendChild() {} }),
-  title: '',
+  title: '', readyState: 'complete', addEventListener() {},
 };
-globalThis.window = { devicePixelRatio: 1, addEventListener() {}, prompt: () => null };
+// prompt 默认给 null（模拟"用户不肯输令牌"）；跑带 CONTROL_TOKEN 的服务端时用
+// CTL_TOKEN 环境变量喂进去，否则 401 分支会把所有下发都测成失败。
+// confirm 固定 false：撤销是危险动作，回归脚本不该真的去撤服务端上的指令。
+globalThis.window = {
+  devicePixelRatio: 1, addEventListener() {},
+  prompt: () => process.env.CTL_TOKEN || null,
+  confirm: () => false,
+};
 globalThis.setInterval = () => 0;
 // 桩成"由服务端提供页面"这一种情况：这样脚本走同源相对路径，
 // 下面 fetch 桩再把相对路径补成绝对地址。file:// 分支另有单测覆盖。
@@ -101,3 +117,56 @@ console.log('|a| 落在 0.8~1.2 之外:', s.pts.filter(p => p.mag !== null && (p
 console.log('x 单调递增:', s.pts.every((p, i) => i === 0 || p.x >= s.pts[i - 1].x));
 console.log('canvas 绘制调用:', draw.length, ' stroke:', draw.filter(d => d[0] === 'stroke').length);
 console.log('服务端 trust.counts:', JSON.stringify(rr.trust.counts));
+
+// ================= 第2周：远程指令面板 =================
+// 这一段盯的是指令面板最容易坏、又最难用肉眼看出来的两件事：
+//   1. 连点三次结果下发了三条（防抖失效）——只能真的去点、数 POST 次数来证明；
+//   2. 参数范围前后端各写一份然后对不上——只能把服务端给的 ops 原样打出来对。
+const CMD_JS = new URL('../static/commands.js', import.meta.url);
+const cmdCode = fs.readFileSync(CMD_JS, 'utf8');
+
+const posts = [];                       // 只数"下发指令"这一个端点，轮询 GET 不算
+const stubFetch = globalThis.fetch;
+globalThis.fetch = (u, o) => {
+  if (o && o.method === 'POST' && String(u).includes('/api/v1/commands')) posts.push(String(u));
+  return stubFetch(u, o);
+};
+
+const fail = msg => { console.error('FAIL: ' + msg); process.exit(1); };
+
+new Function(cmdCode)();
+await new Promise(r => setTimeout(r, 1600));
+
+console.log('\n--- 远程指令面板 ---');
+const opsBox = get('cmd_ops');
+const btns = opsBox.children.filter(c => c.tagName === 'button');
+const inps = opsBox.children.filter(c => c.tagName === 'input');
+if (!btns.length) fail('一个指令按钮都没渲染出来（/commands/ops 没取到？）');
+console.log('按钮:', btns.map(b => b.textContent + (b.disabled ? '(禁用)' : '')).join('  '));
+for (const i of inps) console.log('  参数框', i.id, '=', i.value, ' 范围', i.min, '~', i.max);
+console.log('统计栏:', txt(get('cmd_stats')));
+
+const rows = get('cmd_tbody').children;
+console.log('表格行数:', rows.length);
+for (const tr of rows.slice(0, 6)) {
+  const td = tr.children;
+  if (td.length < 7) { console.log('  ', txt(td[0])); continue; }
+  const badge = td[2].children[0];
+  console.log('  ', txt(td[0]).slice(0, 34).padEnd(34),
+    '|', (badge ? badge.className : '').padEnd(16), txt(badge),
+    '| 样本', td[4].textContent, '|', txt(td[5]).slice(0, 40));
+}
+
+// --- 防抖断言：连点三次 ping，服务端只应该收到一次 POST ---
+posts.length = 0;
+get('cmd_mac').value = '94:A9:90:1C:6F:D4';
+const ping = btns.find(b => String(b.textContent).startsWith('ping'));
+if (!ping) fail('找不到 ping 按钮');
+ping.onclick(); ping.onclick(); ping.onclick();
+await new Promise(r => setTimeout(r, 1500));
+console.log('\n--- 防抖断言 ---');
+console.log('连点 3 次 ping → 实际 POST /api/v1/commands 次数:', posts.length);
+if (posts.length !== 1) fail('期望 1 次，实际 ' + posts.length + ' 次（前端防抖失效）');
+console.log('提示栏:', txt(get('cmd_note')));
+console.log('按钮恢复可用:', btns.every(b => !b.disabled) ? '（下一次点击是新意图）' : 'FAIL 仍禁用');
+console.log('OK: 前端防抖生效');

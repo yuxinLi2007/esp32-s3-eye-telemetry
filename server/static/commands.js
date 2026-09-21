@@ -84,6 +84,17 @@
     const out = {};
     for (const p of (spec ? spec.params : [])) {
       const input = $('cmd_p_' + p.name);
+      // 第3周：字符串参数（白名单 enum，服务端 ops 清单里带 choices）。
+      // 取值照旧不另抄一份——下拉框的选项就是从 choices 渲染出来的。
+      if (p.kind === 'str') {
+        const v = input.value;
+        if (!(p.choices || []).includes(v)) {
+          note(p.name + ' 只能是 ' + (p.choices || []).join('/') + '，当前是 "' + v + '"', true);
+          return null;
+        }
+        out[p.name] = v;
+        continue;
+      }
       const raw = input.value.trim();
       const v = parseInt(raw, 10);
       if (!/^-?\d+$/.test(raw)) { note(p.name + ' 必须是整数，当前是 "' + raw + '"', true); return null; }
@@ -211,7 +222,8 @@
     const pick = [];
     for (const k of ['n_acked', 'n_sampled', 'spl_avg_db', 'mag_avg', 'uptime_s',
                      'rssi_dbm', 'free_heap', 'ring_count', 'accel_verdict',
-                     'mic_verdict', 'collect_enabled']) {
+                     'mic_verdict', 'collect_enabled', 'decision', 'event_id',
+                     'led_pin_note']) {
       if (r[k] !== undefined && r[k] !== null) pick.push(k + '=' + r[k]);
     }
     return pick.length ? pick.join('　') : JSON.stringify(r).slice(0, 120);
@@ -222,20 +234,39 @@
     box.innerHTML = '';
     if (!ops) { box.appendChild(el('span', 'note', '正在读取指令清单 …')); return; }
     for (const spec of ops) {
-      if (spec.op === 'capture') {
+      if (spec.params && spec.params.length) {
         for (const p of spec.params) {
           const lab = el('label', null, p.name);
-          const inp = el('input');
-          inp.type = 'number';
-          inp.id = 'cmd_p_' + p.name;
-          inp.value = p.default;
-          inp.min = p.lo; inp.max = p.hi;
+          let inp;
+          if (p.kind === 'str') {
+            // 第3周：白名单字符串渲染成下拉框（notify 的 decision=ack/cancel）
+            inp = el('select');
+            inp.id = 'cmd_p_' + p.name;
+            for (const ch of (p.choices || [])) {
+              const o = el('option', null, ch);
+              o.value = ch;
+              inp.appendChild(o);
+            }
+            inp.value = p.default;
+          } else {
+            inp = el('input');
+            inp.type = 'number';
+            inp.id = 'cmd_p_' + p.name;
+            inp.value = p.default;
+            inp.min = p.lo; inp.max = p.hi;
+          }
           inp.disabled = !!busyOp;
           box.appendChild(lab); box.appendChild(inp);
         }
-        box.appendChild(el('span', 'note', 'n≤' + spec.params[0].hi +
-          '，interval ' + spec.params[1].lo + '~' + spec.params[1].hi + ' ms，n×interval≤' +
-          maxCaptureMs + ' ms'));
+        if (spec.op === 'capture') {
+          box.appendChild(el('span', 'note', 'n≤' + spec.params[0].hi +
+            '，interval ' + spec.params[1].lo + '~' + spec.params[1].hi + ' ms，n×interval≤' +
+            maxCaptureMs + ' ms'));
+        } else if (spec.op === 'notify') {
+          box.appendChild(el('span', 'note',
+            'decision：设备播放的反馈图案（ack=两下慢闪 / cancel=六下快闪）；' +
+            'event_id=0 表示手动测试，正常回应请走上面的按键事件面板'));
+        }
         box.appendChild(el('span', 'note', ''));
       }
       const b = el('button', 'btn op', spec.op);

@@ -176,6 +176,34 @@
   </section>
 
   <section>
+    <h3>按键事件（第3周）</h3>
+    <div class="prov">
+      <div class="cmdrow">
+        <span class="note" id="btn_stats"></span>
+        <button class="btn" id="btn_refresh">立即刷新</button>
+      </div>
+      <div class="note" id="btn_note"></div>
+    </div>
+    <div class="tablewrap" style="margin-top:10px">
+      <table>
+        <thead><tr>
+          <th class="l">服务端收到</th><th class="l">事件</th><th class="l">设备</th>
+          <th class="l">板端按下时刻</th><th class="l">事件状态</th>
+          <th class="l">notify 指令</th><th class="l">操作</th>
+        </tr></thead>
+        <tbody id="btn_tbody"></tbody>
+      </table>
+    </div>
+    <div class="note">
+      佩戴者按下板上按键时，LED 立刻单闪——本地反馈不等网络。事件上报到这里后，
+      点「回应 / 取消」会通过第2周的指令通道下发一条 notify，设备领取后播放
+      对应图案（ack=两下慢闪，cancel=六下快闪）。「notify 指令」一列就是那条指令
+      的实时状态：expired = 设备没来领（离线），timeout = 领了没结果，
+      done = 设备已播放反馈。失败不静默：终态非 done 时给出「重发」。
+    </div>
+  </section>
+
+  <section>
     <h3>加速度合矢量 |a|（g）</h3>
     <div class="chartbox">
       <canvas id="c_acc"></canvas>
@@ -790,5 +818,6 @@ window.DASH = {
 };
 </script>
 <script src="commands.js"></script>
+<script src="button.js"></script>
 </body>
 </html>

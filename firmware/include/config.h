@@ -75,7 +75,7 @@
 // notify 指令回执带的 led_pin_note 也会随之不再报 pin_unverified。
 #define PIN_LED_VERIFIED   1
 
-#define FW_VERSION          "0.3.0"
+#define FW_VERSION          "0.3.1"
 
 // 必须明显小于服务端 db.NTP_FRESH_THRESHOLD_S(300 秒)。
 // 原值 30 分钟远大于 300 秒，实测导致同步年龄一路上涨、3000 个样本全部被判成

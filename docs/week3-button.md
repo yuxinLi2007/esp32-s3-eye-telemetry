@@ -480,7 +480,7 @@ pio run                              # 编译；烧写：pio run -t upload
 
 | # | 检查 | 期望 | 不符时怎么办 |
 | --- | --- | --- | --- |
-| 1 | 上电后 1 秒内 LED | 单闪一次（已实测：GPIO3） | 没亮 → 先查串口是否到 `[btn] 按键通道就绪`，再查 `PIN_LED` |
+| 1 | 上电后 1 秒内 LED | 单闪一次（`GPIO3`，高有效） | 没亮 → 先查串口是否到 `[btn] 按键通道就绪`，再查 `PIN_LED` |
 | 2 | LED 常亮不灭 | 不应出现 | 低有效 → `LED_ON_LEVEL` 改 `LOW` |
 | 3 | 按 BOOT 键 | 立刻单闪，串口 `[btn] 按下 seq=…` | 一次按压打出多条 seq → 加大 `BUTTON_DEBOUNCE_MS` |
 | 4 | 串口 `[btn] 上传成功 seq=… HTTP 201` | 201（重发时 200） | 401 → `secrets.h` 的 `INGEST_TOKEN` 与服务端不一致 |
@@ -495,7 +495,7 @@ pio run                              # 编译；烧写：pio run -t upload
 ## 仍未解决 / 下一步
 
 1. ~~**LED 引脚与有效电平未在硬件上确认**（4.5）~~ **已于 2026-09-21 上板关闭**：
-   实测为 `GPIO3` / 高电平点亮，`PIN_LED_VERIFIED=1`。原降级方案
+   依据官方 esp-bsp 清单核实为 `GPIO3` / 高电平点亮，`PIN_LED_VERIFIED=1`。原降级方案
    （`PIN_LED_VERIFIED` + `led_pin_note` 把"没确认"带到界面上）已完成使命，
    但真正的确认只能靠上板。
 2. **反馈只有 LED**。佩戴场景下更合适的是振动马达或蜂鸣器；

@@ -549,7 +549,7 @@ enum 白名单**必须在服务端**：`decision` 会被拼进 claim 的文本�
 这是"不确定就实测"在暂时没条件实测时的降级版本——至少让"未验证"可见。
 
 **2026-09-21 上板兑现**：GPIO21 是 LCD 像素时钟，板载 LED 实为 `GPIO3`、高电平点亮。
-已改 `PIN_LED=3` / `PIN_LED_VERIFIED=1`，按 BOOT 单闪实测通过。
+已改 `PIN_LED=3` / `PIN_LED_VERIFIED=1`（结论来自官方 BSP 清单）。
 真机端到端见下表更新。
 
 ### 验证
@@ -560,7 +560,7 @@ enum 白名单**必须在服务端**：`decision` 会被拼进 claim 的文本�
 | `tools/command_sim.py` | **169 断言全通过**（新增 S11 按键闭环 26 条：上报 201/幂等 200、换 `boot_id` 后 seq=0 再来一条、respond 去重、`bad_decision`、claim 文本协议、done 回执回显、重发、cancel、`queue_dropped` 透传） |
 | `tools/ui_check.mjs` | 第1、2周检查无回归；`notify` 的 decision 枚举框 = `ack/cancel`；按键面板渲染出真实事件行；连点 3 次「回应」→ **1 次 POST** 且 `client_token` 唯一 |
 | `pio run` | 编译通过，RAM 17.7% / Flash 27.7% |
-| 真机端到端 | **已做**（2026-09-21）：`PIN_LED=3` 上板核实，按 BOOT 本地单闪、事件上报、Web 回应/取消闭环均通 |
+| 真机端到端 | **部分**（2026-09-21）：按键/指令闭环在早期真机跑通（见事件表）；`PIN_LED=3` 依据官方 BSP 清单核实，物理单闪待肉眼确认 |
 
 ---
 

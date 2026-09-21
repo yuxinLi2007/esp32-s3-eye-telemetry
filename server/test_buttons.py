@@ -151,6 +151,33 @@ def test_queue_dropped_is_visible(client):
     assert r.json()["event"]["queue_dropped"] == 2
 
 
+# ------------------------------------------------------------------ 状态防伪
+def test_forged_state_fields_are_ignored(client):
+    """设备上报里塞 state=acked/decision=ack/request_id 必须被丢掉。
+
+    状态是"人点了回应"这件事的记录，只能由服务端在 respond 里写。
+    一旦采信载荷，没人点过回应的行也会显示"已回应"——闭环的语义就塌了。
+    """
+    r = press(client, 0, state="acked", decision="ack",
+              request_id="req_forged_000000", id=999999, respond_count=7,
+              t_server_ms=1, decided_by="attacker")
+    assert r.status_code == 201, r.text
+    e = r.json()["event"]
+    assert e["state"] == "received"
+    assert e["decision"] is None and e["request_id"] is None
+    assert e["respond_count"] == 0
+    assert e["t_server_ms"] > 1
+    assert e["id"] != 999999
+
+
+def test_respond_rejects_separator_in_decision(client):
+    """decision 走 enum 白名单，不给 claim 参数段注入留口子。"""
+    eid = press(client, 0).json()["event"]["id"]
+    r = respond(client, eid, "ack;event_id=1")
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "bad_decision"
+
+
 # ------------------------------------------------------------------ 列表
 def test_events_list_order_and_filter(client):
     press(client, 0)

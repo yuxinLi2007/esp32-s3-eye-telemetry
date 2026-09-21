@@ -9,7 +9,8 @@
 
 ```bat
 :: 1. 板子 USB 插上，手机热点打开（热点名/密码要和 secrets.h 里一致）
-:: 2. 双击仓库根目录的 start_server.bat，窗口开着别关
+:: 2. 双击仓库根目录的「插上板子自动采集.bat」(推荐，自动起服务端+开看板+守护)
+::    或 start_server.bat（前台只起服务端），窗口开着别关
 :: 3. 跑体检
 D:\anaconda3\python.exe server\tools\doctor.py
 :: 4. 有 FAIL 就按它打印的 -> 提示修；防火墙那两项 FAIL 就跑：
@@ -18,6 +19,40 @@ powershell -ExecutionPolicy Bypass -File server\tools\fix_firewall.ps1
 ```
 
 `doctor.py` 是**只读诊断**，不会改你系统任何东西；`fix_firewall.ps1` 会改防火墙，会弹 UAC。
+
+---
+
+## 一·五、最省心：让服务端常驻，插上板子打开网页就有数据
+
+「双击 `server/static/index.html` 显示**无法连接服务端**」九成就一个原因：
+**uvicorn 没在跑**。浏览器里的 JS 出于安全沙箱**无法启动本地进程**，所以网页
+自己变不出服务端——必须有一个本地常驻的守护先把服务端拉起来。`auto_serve.py`
+就是干这个的，它做三件事：
+
+1. **保证服务端在 `0.0.0.0:8000` 上跑着**：没起就起、崩了就重启、已在跑就接管
+   （绑 `0.0.0.0` 而非 `127.0.0.1`，板子才能从手机热点/局域网把数据传进来）。
+2. **盯着开发板**（USB `VID_303A & PID_1001`，ESP32-S3 原生 USB-Serial/JTAG）：
+   板子从「没插」变成「插上」时，自动用默认浏览器打开 <http://localhost:8000/>。
+3. **可注册开机自启**，开机即在后台守护——这样「插上板子打开网页自动就有数据」
+   才跨重启成立（服务端永远在线）。
+
+```bat
+:: A. 一次性：双击仓库根目录的「插上板子自动采集.bat」
+::    = python server\tools\auto_serve.py --watch（起服务端 + 开看板 + 守护）
+
+:: B. 让服务端开机即后台常驻（写入当前用户启动项，无窗口）
+D:\anaconda3\python.exe server\tools\auto_serve.py --install-startup
+::    卸载： --uninstall-startup     停止当前守护： --stop
+::    只想起一次并开看板、不守护： --once
+```
+
+它**不碰防火墙、不烧固件、不改任何系统设置**（除非你显式 `--install-startup`）。
+日志在 `server/data/auto_serve.log`，服务端输出在 `server/data/uvicorn.log`。
+守护进程 PID 写在 `server/data/auto_serve.pid`。
+
+> 注意：开机自启的守护带 `--no-browser-on-start`，**登录时不会弹浏览器**（免得每次
+> 开机都弹窗），只在「板子由未插变为插上」那一刻弹看板。要立刻看数据，双击
+> `插上板子自动采集.bat` 或直接开 <http://localhost:8000/> 即可。
 
 ---
 

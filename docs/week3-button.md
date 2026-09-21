@@ -35,7 +35,7 @@
 | `server/static/commands.js` | 指令面板 | `renderOps` 泛化：所有带参数的 op 都渲染输入（str→`<select>`，int→number）；`resultSummary` 认 `decision`/`event_id`/`led_pin_note` | 原来写死了"参数就是数字"；notify 一来就必须泛化，否则前端要为新 op 改代码——那就违背了"ops 目录是唯一来源" |
 | `server/tools/command_sim.py` | 假设备 + 故障注入 | 新增 **S11 按键闭环**（26 条断言）；S0 白名单断言跟着 OPS 走 | |
 | `server/tools/ui_check.mjs` | 前端回归 | 新增按键面板段：渲染断言 + **回应防抖/幂等键断言** + notify 的 `decision` 枚举断言 | |
-| `server/test_buttons.py` | — | **新增**：23 个单测 | |
+| `server/test_buttons.py` | — | **新增**：25 个单测（含 6.5 状态防伪 2 个） | |
 
 **没有改的**：传感器读取路径、`uplink.*`（HTTP 出口）、图表绘制、
 时间戳可信度口径、`request_id` 生成规则、指令状态机本体、入库鉴权。
@@ -317,9 +317,9 @@ void loop() {
 
 ## 第六步：鲁棒性测试
 
-### 6.1 单元/契约层 —— `pytest`（128 passed）
+### 6.1 单元/契约层 —— `pytest`（130 passed）
 
-`server/test_buttons.py` 23 个，重点：
+`server/test_buttons.py` 25 个，重点：
 
 - 幂等：同键重发 → `deduped=True`、**不新增行**、原字段不被覆盖；
 - 不同 `boot_id` + 同 `press_seq` → 必须是两条；
@@ -328,19 +328,22 @@ void loop() {
   "重点即重发"语义、`bad_decision`、`not_found`、事件行只在非 deduped 时更新；
 - `list_events`：`state` 过滤（含非法 state → `bad_state`）、指令摘要现查、
   `sweep()` 被调用（expired 的 notify 在事件列表里也必须是 expired）；
-- `ops_catalog` 是前端唯一来源（`test_commands.py` 的 op 集合断言已含 `notify`）。
+- `ops_catalog` 是前端唯一来源（`test_commands.py` 的 op 集合断言已含 `notify`）；
+- **状态防伪**：上报载荷里塞 `state/decision/request_id/id` 一律被丢掉（见 6.5）。
 
 > 踩到的坑：fixture 里必须**同时** monkeypatch `commands.now_ms` 和
 > `buttons.now_ms`——`from commands import now_ms` 是绑定副本，
 > 只改一边会让"超时判定"用真实时钟，测试变成时序彩票。
 
-### 6.2 端到端层 —— `tools/command_sim.py` S11（169 passed / 0 failed）
+### 6.2 端到端层 —— `tools/command_sim.py` S11 + S12（188 passed / 0 failed）
 
 S11 打真实 HTTP，26 条断言，覆盖：新建 201 / 重发 200+`X-Deduped` /
 换 `boot_id` 后 seq=0 再来一条 / 列表与 stats / respond 201 / respond 幂等 200 /
 `bad_decision` 400 / **claim 文本协议**（`rid|notify|decision=ack;event_id=1|15000`，
 参数按字母序，`decision` 在 `event_id` 前）/ done 回执后事件行回显 /
 `respond_count` 递增 / 再次 respond 产生新指令 / cancel 路径 / `queue_dropped` 透传。
+
+S12（第3周补的**状态防伪**段，19 条）见 6.5。
 
 ### 6.3 前端回归层 —— `tools/ui_check.mjs`
 
@@ -356,6 +359,92 @@ S11 打真实 HTTP，26 条断言，覆盖：新建 201 / 重发 200+`X-Deduped`
 
 `pio run` 通过：RAM 17.7% / Flash 27.7%。**未上板**——见 4.5 与下面的清单。
 
+### 6.5 状态防伪 —— 设备的"我"不能替服务端的"事实"作证
+
+闭环里有两套状态（事件三态、指令现查），它们**只能由服务端写**。
+设备侧任何字段都是"设备自称"，不是事实。这一段的断言就是把这条边界钉死：
+
+| 被伪造的东西 | 谁会受害 | 服务端实际行为 | 断言 |
+| --- | --- | --- | --- |
+| 上报载荷里带 `state:"acked"` | 没人点过回应，界面却显示"已回应" | 载荷字段被忽略，状态强制 `received` | 6.5 第 1 组 |
+| 带 `decision` / `request_id` / `respond_count` | 事件行凭空挂上一条不存在的指令 | 一律不写库 | 6.5 第 1 组 |
+| 带 `id` / `t_server_ms` | 覆盖别人的行、倒填权威时间 | 主键与权威时间都由服务端生成 | 6.5 第 1 组 |
+| 无令牌直接 POST | 任意人伪造按键/回应 | `401`（`X-Ingest-Token` / `X-Control-Token`） | 6.5 第 2 组 |
+| `decision` 里带 `;` `=` | 用分隔符往 claim 参数段里注入 | enum 白名单拒掉 `bad_decision` | 6.5 第 3 组 |
+| 设备自报"这条指令 done 了" | 服务端显示成功，其实没人领过 | 未领取 → `not_claimed 409` | 6.5 第 4 组 |
+| 终态指令再补一条回执 | 已经显示过的"成功/超时"被改写 | 终态不可改 → `already_terminal 409` | 6.5 第 4 组 |
+
+自动化跑法（一条命令覆盖上表）：
+
+```powershell
+cd server
+$env:INGEST_TOKEN="..."; $env:CONTROL_TOKEN="..."
+python -X utf8 tools\command_sim.py --url http://127.0.0.1:8001 --fast   # 看 [S12] 段
+python -X utf8 -m pytest -q test_buttons.py -k "forged or separator"      # 2 个单测
+```
+
+> **前置条件**：`401` 那两条只在实例真设了令牌时才断言。没设令牌的实例对任何人都开放，
+> 那时"无令牌被拒"不成立，脚本会打印 `SKIP` 而不是假通过。
+
+手工验证"状态不能伪造"（不需要板子，照着粘贴即可）：
+
+```powershell
+# 伪造一条"已回应"的上报，看服务端给回的真实状态
+$H = @{ "X-Ingest-Token"="<INGEST_TOKEN>"; "Content-Type"="application/json" }
+$body = '{"device_mac":"94:A9:B8:10:00:0F","boot_id":"FORGE1","press_seq":1,"state":"acked","decision":"ack","request_id":"req_forged","t_server_ms":1}'
+Invoke-WebRequest -Uri http://127.0.0.1:8000/api/v1/button -Method POST -Headers $H -Body $body | Select-Object -ExpandProperty Content
+# 期望：返回体里 "state":"received"、"decision":null、"request_id":null、t_server_ms 是当下时间
+# 且网页该行显示「待回应」——伪造的 acked 没有生效
+```
+
+再看页面：刷新网页，这一行必须是**待回应**，操作列有「回应」「取消」。
+如果它显示"已回应"，说明服务端采信了客户端状态——第3周的闭环语义就塌了。
+
+### 6.6 断网本地触发 —— 怎么测"本地反馈不依赖网络"
+
+这是第3周最硬的一条：**按下 → 立刻闪灯**必须发生在 Wi-Fi 关联之前。
+代码上由 `main.cpp` 的结构保证（`button_poll()` 在 `WiFi.status()` 判断**之外**），
+但要证明它成立，必须在断网条件下真按一次。
+
+**板端（真机，主验证）：**
+
+1. 烧好 0.3.0，串口监视器打开，确认能上网、网页有数据（先证明基线是通的）。
+2. 制造断网。三选一，**推荐第 1 种**（最接近"佩戴时走出覆盖范围"）：
+   - 关掉手机热点 / 关掉路由器 —— 板子会不停地重连，符合真实断网；
+   - 把路由器加一条 MAC 黑名单，只断开这块板子（不影响你上网）；
+   - 改 `secrets.h` 里 SSID 为不存在的名字重烧（最彻底，但每次要重烧，不推荐）。
+3. 断网后**立刻连按 3 次 BOOT 键**。期望：
+   - 每按一次，LED **立刻**单闪一次——不卡顿、不等待、不滞后；
+   - 串口出现 `[btn] 按下 seq=0/1/2 …（LED 已本地反馈）`；
+   - 串口出现 `[btn] 上传失败 seq=… HTTP -1（…5000 ms 后重试，本地反馈已给过，事件不会丢）`；
+   - **这一步就是结论**：本地反馈和上报是两条路，网络断了不影响反馈。
+4. 恢复网络，等最多 `BUTTON_RETRY_MS`（5 秒）。期望：
+   - 串口 `[btn] 上传成功 seq=… HTTP 201`，**3 条都会补上**；
+   - 网页出现 3 行「待回应」，时间戳按服务端收到时刻（不是按下时刻）。
+5. 验证"丢事件也要留痕"：断网期间连按 **12 次**（超过 `BUTTON_QUEUE=8`）。期望：
+   - 前 8 次进队列，第 9 次起串口打印
+     `[btn] 待传队列已满（8 条），本次按键丢弃并记账 queue_dropped=N`；
+   - 恢复网络后，上来的事件里带上 `queue_dropped`，网页该行显示
+     「板上曾丢弃 N 次」。**丢的按键数不许静默消失。**
+
+**服务端（不需要板子，验证"断网期间的响应会被判失败"）：**
+
+设备离线时在网页点「回应」，`notify` 的 ttl 是 30 秒，没人来领 → 到点判 `expired`：
+
+```powershell
+cd server
+$env:TELEMETRY_DB=".\data\sim-offline.db"; $env:INGEST_TOKEN="..."; $env:CONTROL_TOKEN="..."
+python -X utf8 -m uvicorn app:app --port 8001 --env-file .env   # 另开终端
+# 造一条按键事件，再回应它，但**不**跑假设备去领取：
+python -X utf8 tools\command_sim.py --url http://127.0.0.1:8001     # 不加 --fast，等 30 秒
+```
+
+期望：网页该行先显示"已回应 / 等待设备领取"，30 秒后指令变 **expired**，
+行上出现「重发」入口——而不是一直转圈假装还在等。
+`command_sim.py` 的 S10「设备离线」段正是这条的自动化版本。
+
+---
+
 ---
 
 ## 怎么跑
@@ -363,7 +452,9 @@ S11 打真实 HTTP，26 条断言，覆盖：新建 201 / 重发 200+`X-Deduped`
 ```powershell
 # 1) 服务端（用独立库，别污染真实数据）
 cd server
-$env:DB_PATH=".scratch\sim3.db"; uvicorn app:app --port 8001
+$env:TELEMETRY_DB="D:\esp32-s3-eye-telemetry\.scratch\sim3.db"
+$env:INGEST_TOKEN="<与 secrets.h 一致>"
+python -X utf8 -m uvicorn app:app --port 8001 --env-file .env
 
 # 2) 端到端（另开一个终端）
 cd server
@@ -375,7 +466,7 @@ node tools\ui_check.mjs --origin http://127.0.0.1:8001
 
 # 4) 单元测试
 cd server
-python -X utf8 -m pytest -q          # 128 passed
+python -X utf8 -m pytest -q          # 130 passed
 
 # 5) 固件
 cd firmware

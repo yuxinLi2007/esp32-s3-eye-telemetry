@@ -788,8 +788,12 @@ async function tick() {
     $('refreshed').textContent = '最近刷新 ' + new Date().toLocaleTimeString('zh-CN', { hour12:false })
       + '　服务端时间 ' + fmtTime(st.server_time_ms);
   } catch (e) {
-    // 服务端本身不可达也必须看得见，不能停在旧数据上假装一切正常
-    setAlarm('crit', '无法连接服务端', String(e.message || e));
+    // 服务端不可达必须看得见，且要给出能照做的修复指引，而不是只甩一句网络错误。
+    const viaFile = location.protocol === 'file:';
+    const hint = viaFile
+      ? '服务端没在跑。请双击仓库根目录的「插上板子自动采集.bat」（或 start_server.bat），窗口开着别关，再刷新本页。'
+      : '服务端没在跑或刚重启。请在服务器上运行 start_server.bat / auto_serve.py，稍候刷新。';
+    setAlarm('crit', '无法连接服务端 · ' + (API || '同源'), hint + '　（' + String(e.message || e) + '）');
   } finally {
     inflight = false;
   }

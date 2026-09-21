@@ -22,5 +22,16 @@ echo.
 echo   按 Ctrl+C 或直接关窗口即可停止。
 echo.
 
+rem 幂等：8000 已在跑就别重复起（否则 uvicorn 会因端口占用直接退出）。
+rem 已在跑则直接开浏览器到服务端托管的看板（同源，省去 file:// 的跨源麻烦）。
+"%PY%" -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health',timeout=2).status==200 else 1)" 2>nul
+if not errorlevel 1 (
+  echo [已在运行] 服务端已就绪，直接打开看板 http://localhost:8000/
+  start "" "http://localhost:8000/"
+  exit /b 0
+)
+
+rem 先开浏览器：页面会轮询，等服务端绑定端口后自动连上，不必等窗口阻塞。
+start "" "http://localhost:8000/"
 "%PY%" -m uvicorn app:app --host 0.0.0.0 --port 8000 %ENVARGS%
 pause

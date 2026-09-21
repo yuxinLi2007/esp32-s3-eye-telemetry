@@ -86,7 +86,8 @@ flowchart TB
 ```
 esp32-s3-eye-telemetry/
 ├── README.md                        ← 本文件
-├── start_server.bat                 Windows 一键启动服务端
+├── start_server.bat                 Windows 一键启动服务端（前台、幂等）
+├── 插上板子自动采集.bat              Windows 一键守护：起服务端+开看板+崩溃自愈+插板弹窗
 ├── docs/
 │   ├── development-log.md           开发复盘：分阶段记录坑与验证结果
 │   ├── week2-commands.md            第2周：远程指令通道的设计与验证（状态机/协议/端点）
@@ -112,7 +113,7 @@ esp32-s3-eye-telemetry/
     ├── buttons.py                   按键事件：幂等入库、事件三态、Web 回应（复用 commands）
     ├── test_ingest.py               27 项测试（第1周）
     ├── test_commands.py             80 项测试（第2周）
-    ├── test_buttons.py              23 项测试（第3周）
+    ├── test_buttons.py              25 项测试（第3周，含状态防伪）
     ├── requirements.txt
     ├── static/
     │   ├── index.html               主界面：图表、指标卡、采集开关、指令面板、按键面板骨架
@@ -122,7 +123,8 @@ esp32-s3-eye-telemetry/
     │   ├── doctor.py                一键体检：插上板子网页没数据时定位卡在哪（只读）
     │   ├── fix_firewall.ps1         修防火墙：禁用全局入站拦截 + 放行端口（自动提权）
     │   ├── fault_inject.py          故障注入：主动制造失败以验证"失败可见"
-    │   ├── command_sim.py           假设备模拟器 + 故障注入，打真实 HTTP（169 断言）
+    │   ├── command_sim.py           假设备模拟器 + 故障注入，打真实 HTTP（188 断言）
+    │   ├── auto_serve.py            服务端守护：起/接管/崩溃自愈 + 插板自动弹看板 + 开机自启
     │   └── ui_check.mjs             DOM 打桩跑界面脚本，断言报警判定与两个面板的防抖
     ├── .env.example                 配置模板 → 复制成 .env
     └── data/telemetry.db            运行期数据库，.gitignore 排除
@@ -157,7 +159,16 @@ CONTROL_TOKEN=<再生成一个>
 python -m uvicorn app:app --host 0.0.0.0 --port 8000 --env-file .env
 ```
 
-Windows 上直接双击仓库根目录的 `start_server.bat`，它已带好 `--env-file`。
+Windows 上**最省心**：双击仓库根目录的 `插上板子自动采集.bat`。它会
+① 在 `0.0.0.0:8000` 起服务端（已在跑就接管，不重复起）② 自动用浏览器打开看板
+③ 持续守护——服务端崩了自动重启、开发板插上时自动弹看板。窗口开着 = 守护在跑。
+
+> 只想起一个前台服务端：双击 `start_server.bat`（已带 `--env-file`，且幂等：端口
+> 已被占时会直接开浏览器，而不是因端口占用报错退出）。
+>
+> 想让服务端**开机即在后台常驻**（随时打开网页都有数据）：
+> `python server\tools\auto_serve.py --install-startup`（写入当前用户启动项；
+> 卸载 `--uninstall-startup`，停止当前守护 `--stop`）。
 
 验证：
 
@@ -171,6 +182,8 @@ curl http://127.0.0.1:8000/health
 >
 > 也可以直接双击 `server/static/index.html`，页面会自动连本机 `127.0.0.1:8000`。
 > 但**服务端必须一直在运行**——数据存在它的 SQLite 里，光有一个 HTML 文件变不出数据。
+> 页面若显示「无法连接服务端」，就是服务端没在跑：双击 `插上板子自动采集.bat` 即可
+> （起服务端 + 自动开看板）；用 `--install-startup` 注册开机自启后便永远在线。
 > 服务端在别的机器上时用 `index.html?api=http://服务端地址:8000` 打开。
 
 ### 二、固件编译烧录
@@ -492,10 +505,10 @@ HTTP 重发不会把"用户按了一次"变成"按了两次"。断网期间按�
 
 ```bash
 cd server
-python -m pytest -q                                 # 128 项（27 + 80 + 23，第1~3周）
+python -m pytest -q                                 # 130 项（27 + 80 + 25，第1~3周）
 node tools/ui_check.mjs                   # 对着真实服务端跑界面脚本
 node tools/ui_check.mjs --origin http://127.0.0.1:8001
-python tools/command_sim.py --url http://127.0.0.1:8002   # 端到端 169 项断言
+python tools/command_sim.py --url http://127.0.0.1:8002   # 端到端 188 项断言
 ```
 
 指令通道是"服务端 / 设备 / 网页"三方异步交互，`TestClient` 那种串行假客户端盖不住时序问题
@@ -503,7 +516,7 @@ python tools/command_sim.py --url http://127.0.0.1:8002   # 端到端 169 项断
 它扮演一台假板子去领取、上报、回执，并主动制造 12 类失败——双击与并发提交、参数越界、
 在飞超限、设备报错、迟到/错乱/越权的回执、上传掉样、领取后静默、执行中静默、设备离线——
 逐条断言"失败被如实暴露"。跑完退出码非 0 即有断言失败，可直接挂 CI。
-第3周加了 S11「按键闭环」26 条断言：上报幂等（201/200+`x-deduped`）、换 `boot_id` 后
+第3周加了 S11「按键闭环」26 条与 S12「状态防伪」19 条断言：上报幂等（201/200+`x-deduped`）、换 `boot_id` 后
 `press_seq` 从 0 重来必须是两条、Web 回应的 `client_token` 去重、非法 `decision`、
 claim 文本协议（`rid|notify|decision=ack;event_id=7|15000`）、done 回执后事件行回显、
 重发产生新指令、取消路径、`queue_dropped` 透传。

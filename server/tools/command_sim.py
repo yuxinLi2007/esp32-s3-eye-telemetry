@@ -821,6 +821,91 @@ def s11_button_loop():
        code == 201 and body["event"]["queue_dropped"] == 3, body)
 
 
+def s12_button_anti_forge():
+    print("\n[S12] 第3周状态防伪：设备上报不能自封状态，状态跃迁只在服务端")
+    mac = new_mac()
+    sim = Sim(mac, fw="0.3.0-sim")
+    boot = sim.boot_id
+
+    # 1) 设备在上报里塞满"我已经被回应了"的字段，试图跳过人的确认。
+    #    服务端只从载荷里认它要的那几个字段（mac/boot/seq/...），
+    #    state/decision/request_id/id/t_server_ms 一律由服务端自己决定。
+    #    否则没人点过"回应"，界面上就会出现一行"已回应"。
+    forged = {
+        "device_mac": mac, "boot_id": boot, "press_seq": 100,
+        "fw_version": sim.fw, "state": "acked", "decision": "ack",
+        "request_id": "req_forged_000000", "id": 999999,
+        "t_server_ms": 1, "respond_count": 7, "decided_by": "attacker",
+        "queue_dropped": 0,
+    }
+    code, body, _ = req("POST", "/api/v1/button", forged, token="ingest")
+    ck("伪造 state=acked 的上报仍被收下（未知字段不该 500）", code == 201, err(body))
+    ev = body["event"]
+    ck("事件状态仍是服务端认定的 received（伪造的 acked 被忽略）",
+       ev["state"] == "received", ev["state"])
+    ck("伪造的 decision 未进库", ev["decision"] is None, ev["decision"])
+    ck("伪造的 request_id 未进库", ev["request_id"] is None, ev["request_id"])
+    ck("伪造的 respond_count=7 未进库", ev["respond_count"] == 0, ev["respond_count"])
+    ck("伪造的 t_server_ms=1 未进库（权威时间由服务端决定）",
+       ev["t_server_ms"] > 1_700_000_000_000, ev["t_server_ms"])
+    ck("伪造的 id=999999 未进库", ev["id"] != 999999, ev["id"])
+    eid = ev["id"]
+
+    # 2) 没令牌 = 既不能上报，也不能回应。
+    #    只在服务端真设了令牌时才断言 401：没设令牌的实例对任何人都是开放的，
+    #    那时"无令牌被拒"根本不成立，硬断言等于把环境问题报成代码问题。
+    if INGEST_TOKEN:
+        code, body, _ = req("POST", "/api/v1/button",
+                            {"device_mac": mac, "boot_id": boot, "press_seq": 101})
+        ck("无 X-Ingest-Token 上报被拒 401", code == 401, code)
+    else:
+        print("  SKIP  无 X-Ingest-Token 上报 401（本实例未设 INGEST_TOKEN）")
+    if CONTROL_TOKEN:
+        code, body, _ = req("POST", "/api/v1/button/events/%d/respond" % eid,
+                            {"decision": "ack"})
+        ck("无 X-Control-Token 回应被拒 401", code == 401, code)
+    else:
+        print("  SKIP  无 X-Control-Token 回应 401（本实例未设 CONTROL_TOKEN）")
+
+    # 3) decision 是 enum：不给"用分隔符注入 claim 参数段"留口子
+    code, body, _ = req("POST", "/api/v1/button/events/%d/respond" % eid,
+                        {"decision": "ack;event_id=1"}, token="control")
+    ck_err("decision 里塞分隔符被拒（bad_decision，注入不了参数段）",
+           body, "bad_decision")
+    code, body, _ = req("POST", "/api/v1/button/events/999999999/respond",
+                        {"decision": "ack"}, token="control")
+    ck("对不存在的事件回应 -> 404", code == 404, code)
+
+    # 4) 状态跃迁只在服务端：设备不能把一条指令自己置成 done
+    code, body, _ = req("POST", "/api/v1/button/events/%d/respond" % eid,
+                        {"decision": "ack", "client_token": mk_token("s12a")},
+                        token="control")
+    ck("回应生成 notify 指令 201", code == 201, err(body))
+    rid = body["command"]["request_id"]
+
+    code, res, _ = sim.done(rid, result={"led_feedback": True})
+    ck("设备对尚未领取的指令直接回执 done 被拒 409（不能自封完成）",
+       code == 409, (code, res))
+    ck("  错误码 = not_claimed", (res.get("error") or {}).get("code") == "not_claimed",
+       res)
+
+    j = sim.claim()
+    ck("设备正常领取到该指令", j is not None and j["request_id"] == rid, j)
+    if j:
+        code, res, _ = sim.done(rid, result={"led_feedback": True})
+        ck("领取后回执 done 被接受", code == 200, err(res))
+        code, res, _ = sim.done(rid, result={"led_feedback": True})
+        ck("已终态指令再收一次回执被拒 409（成功不能被重写）", code == 409, (code, res))
+        ck("  错误码 = already_terminal",
+           (res.get("error") or {}).get("code") == "already_terminal", res)
+
+    # 最终事实仍以事件行为准：只认服务端写进去的状态
+    code, body, _ = req("GET", "/api/v1/button/events?limit=50")
+    ev = [e for e in body["events"] if e["id"] == eid][0]
+    ck("事件行状态来自服务端：acked，且挂着真实指令",
+       ev["state"] == "acked" and ev["request_id"] == rid, ev)
+
+
 # ---------------------------------------------------------------- 入口
 def main():
     global URL
@@ -855,6 +940,7 @@ def main():
     s7_mismatch()
     s8_cancel()
     s11_button_loop()
+    s12_button_anti_forge()
     if slow:
         finish_slow(slow)
 

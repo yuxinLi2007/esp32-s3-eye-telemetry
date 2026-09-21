@@ -473,6 +473,97 @@ done 回执 422 失败 → 2 秒后幂等重领到同一条 → 从头再跑一�
 
 ---
 
+## 阶段 14 · 第3周：按键触发与物理反馈闭环
+
+设计与协议细节单独成文：[`week3-button.md`](week3-button.md)。这里只记坑与验证。
+
+**做了什么.** 把前两周的两条单向链路接成闭环：板上按键 → **本地立刻** LED 反馈（不等网络）
+→ 上报 VPS → Web 2 秒内出现该行 → 操作者点「回应/取消」→ 复用第2周指令通道下发
+`op=notify` → 设备播放对应图案 → 指令状态回到同一行。
+新增 `server/buttons.py`、`firmware/src/button.*`、`server/static/button.js`；
+`main.cpp` 只加两处接线（`button_begin` / loop 里 `button_poll()`，且放在 Wi-Fi 检查**之前**），
+`command.cpp` 只加一个 `run_notify()`。**没有新造任何一条通信链路**：
+notify 就是 `commands` 表里的一条普通指令，领取/状态机/超时/审计全部复用。
+
+**坑 1 · `from commands import now_ms` 是绑定副本，只 monkeypatch 一边，测试就成了时序彩票.**
+
+`buttons.py` 顶部 `from commands import now_ms`。fixture 里冻结时间时只打了
+`commands.now_ms`，`buttons.now_ms` 仍指向真实时钟——于是"事件 age"用假时间、
+"sweep 超时判定"用真时间，`expired` 相关断言时对时错。必须两边都 patch。
+根因是 from-import 把函数对象**复制**成了本模块的名字；这类"时间注入"应该走
+`monkeypatch.setattr(module, "now_ms", ...)` 逐个模块列清楚，别指望一处生效。
+
+**坑 2 · `commands.py` 原本假设"参数就是整数"，第一个字符串参数牵出四处改动.**
+
+OPS 的 `kind`、`_coerce` 的校验分支、`ops_catalog` 要吐 `choices`、
+前端 `renderOps`/`collectParams` 要能渲染下拉框——四处都长在同一个假设上。
+改完的收益是下一个带枚举参数的 op 只需要在 OPS 里加一行，前端一行都不用动。
+
+enum 白名单**必须在服务端**：`decision` 会被拼进 claim 的文本协议
+（`rid|notify|decision=ack;event_id=7|15000`），而那条协议正是用 `;` 和 `=` 分隔的——
+一个允许任意字符串的参数就等于允许伪造参数段。`_coerce` 拒掉不在 `choices` 里的值，
+板端解析处再加一道截断保护（最坏结果是 `bad_param` 回执，不是缓冲区溢出）。
+
+**坑 3 · node 桩里点 `.onclick()` 绕过了 `disabled`，防抖断言差点测了个假的.**
+
+第2周那段"连点 3 次只应有 1 次 POST"之所以成立，是因为 `commands.js` 里有一行
+**代码级**防抖 `if (busyOp) return;`，不只是把按钮设成 `disabled`。
+写 `button.js` 时我先只做了 DOM 级防抖（`render()` 里 `disabled = busy`）——
+在浏览器里看起来完全正确：第一次点击后按钮就灰了，点不动。
+但在 node 桩里直接调 `onclick()` 会绕过 `disabled`，三次点击变三次 POST。
+
+这不是"测试环境与真实环境不一致"，恰恰相反：**桩暴露了防抖只有一层**。
+真实浏览器里键盘回车连发、辅助功能点击、以及"渲染前的同一 tick 内多次触发"
+都能绕过 `disabled`。补上 `if (busyId !== null) return;`，两层都在，断言才有意义。
+
+**坑 4 · 空态那一行 `colSpan=8`，而表头只有 7 列.**
+
+小事，但"空态"是最少被看到、也最少被检查的界面状态。现在 `ui_check.mjs` 里
+空态也算一行（必须带 `colSpan > 0` 才算合法空态），"一片空白"直接判失败——
+空白和"面板挂了"长得一模一样，靠肉眼分不出来。
+
+**坑 5 · `respond()` 里"先建指令还是先改事件行"决定了这条记录能不能自愈.**
+
+若先更新事件行再创建指令，一旦 `commands.create()` 抛错（在飞已满 429、参数非法、
+数据库忙），库里就留下一条 `state=acked` 而 `request_id=NULL` 的事件——
+界面显示"已回应"，设备永远不会有反馈，而且没有任何入口能重来。
+现在的顺序是反的：指令创建失败 → 事件行原封不动 → 界面显示错误 → 用户重点一次即可。
+
+另一处细节：只有 `deduped=False` 时才 `respond_count+1`。计数是派生幂等键
+（`btn<id>-<decision>-r<count+1>`）的一部分，被网络重试刷上去就等于凭空造出"新意图"，
+设备会闪两遍灯。
+
+**一处刻意的取舍：事件状态不加"设备已确认".**
+
+`button_events.state` 只有 `received / acked / cancelled`，记的是"用户点了什么"。
+设备到底播放了没有，看 `request_id` 关联的那条指令（`done/failed/timeout/expired`）。
+存两份状态迟早漂移，而这里恰好有一份是权威的（`commands` 有完整事件溯源）。
+代价：`list_events` 每次多一条 `SELECT ... WHERE request_id IN (...)`，
+且查询前要先跑 `commands.sweep()`。换来的好处是——按键面板上看到的指令状态
+与指令面板上看到的**永远是同一个答案**，不会出现"这边显示成功、那边显示超时"。
+
+**一处没法验证的东西，就让它自己说话：`PIN_LED_VERIFIED`.**
+
+`PIN_LED=21` / `LED_ON_LEVEL=HIGH` 是照常见资料写的，**没有实物确认**
+（ESP32-S3-EYE 板载 LED 的引脚号在不同版本的资料里本来就不一致，有的批次干脆没有）。
+不想让"界面显示成功、灯其实没亮"这种事静默存在，于是在 `config.h` 立了个开关：
+`PIN_LED_VERIFIED=0` 时，notify 回执带 `led_pin_note="pin_unverified"`，
+一路显示到 Web 的结果摘要里。核对通过后改成 1、`FW_VERSION` → `0.3.1` 即可。
+这是第1周"不确定就实测"那条准则在**暂时没条件实测**时的降级版本：
+不能实测，至少让"未验证"这个状态在数据流里可见，而不是只写在注释里。
+
+### 验证
+
+| 命令 | 结果 |
+|---|---|
+| `pytest -q`（全量） | **128 passed**（27 第1周 + 80 第2周 + 23 新增 `test_buttons.py`；`test_commands.py` 的 op 集合断言已含 `notify`） |
+| `tools/command_sim.py` | **169 断言全通过**（新增 S11 按键闭环 26 条：上报 201/幂等 200、换 `boot_id` 后 seq=0 再来一条、respond 去重、`bad_decision`、claim 文本协议、done 回执回显、重发、cancel、`queue_dropped` 透传） |
+| `tools/ui_check.mjs` | 第1、2周检查无回归；`notify` 的 decision 枚举框 = `ack/cancel`；按键面板渲染出真实事件行；连点 3 次「回应」→ **1 次 POST** 且 `client_token` 唯一 |
+| `pio run` | 编译通过，RAM 17.7% / Flash 27.7% |
+| 真机端到端 | **未做**。见 `week3-button.md` 的「上板验证清单」——第一件事是确认 GPIO21 上到底有没有 LED |
+
+---
+
 ## 横向：三条一直用到的判断准则
 
 ### 1. 同一个事实不要存两处
@@ -555,3 +646,17 @@ done 回执 422 失败 → 2 秒后幂等重领到同一条 → 从头再跑一�
   本来最容易在 PC 上测（host-based unit test），却只能靠真机暴露。
 - **加速度计三轴偏置未校准**：静止时 |a|≈1.67 而非 1.0，`selftest` 恒判
   `accel_out_of_range`。第1周遗留，需要在 `sensors.cpp` 加零偏标定。
+- **`PIN_LED=21` / `LED_ON_LEVEL=HIGH` 未在硬件上确认**（阶段 14）。
+  `PIN_LED_VERIFIED=0` 时 notify 回执带 `led_pin_note="pin_unverified"`，
+  界面因此能看见"这次成功可能没真闪灯"。上板核对后改成 1、`FW_VERSION` → `0.3.1`。
+- **物理反馈只有 LED**。佩戴场景更该用振动马达或蜂鸣器；`button_play_decision()`
+  已经是"按 decision 播一段物理图案"的抽象，换执行器只改这一个函数 + `config.h`。
+- **按键只有一种语义**（按一下 = 一次待回应事件），没有长按/双击/组合键。
+  做手势要先决定判在板上还是服务端：判在板上会给幂等键加一个新维度，
+  判在服务端会让本地反馈变慢——而"立刻有反应"正是这一周最硬的那条要求。
+- **`notify` 的 ttl 只有 30 秒**，设备离线超过 30 秒的回应必然 `expired`。
+  这是刻意的：宁可失败可见，也不要 5 分钟后突然闪灯。
+- **按键上报的重试预算是 10 次 / 队列 8 条**，超出记入 `queue_dropped`
+  并随下一次成功上传报出——痕迹不丢，但事件本身确实丢了。
+- **事件与指令只关联最近一次**（`request_id`）。要审计"这次按键历史上被回应过几次、
+  每次结果如何"，得去 `commands` 表按 `params_json` 里的 `event_id` 反查，够用但不优雅。

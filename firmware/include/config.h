@@ -9,6 +9,17 @@
 
 #define ACCEL_I2C_ADDR   0x12
 #define ACCEL_REG_DATA   0x01 // X/Y/Z 各一对 LSB/MSB，共 6 字节
+// QMA6100P 其余寄存器（与 esp-bsp/components/qma6100p 驱动一致）。
+// 上电后芯片默认处于 suspend，数据寄存器会恒返回 0x0000——这就是
+// "三轴全是 0、合矢量没反应"的根因：I2C 通了、读也没报错，但读到的全是零。
+#define ACCEL_REG_WHO_AM_I  0x00 // 器件 ID
+#define ACCEL_REG_ACCEL_CFG 0x0F // 低 4 位量程：0001=±2g 0010=±4g ...
+#define ACCEL_REG_PWR_MGMT  0x11 // bit7 = 唤醒（active），默认 0 = suspend
+#define ACCEL_REG_NVM_LOAD  0x33 // bit3 = 从 NVM 载入出厂校准
+#define ACCEL_FS_2G         0x01 // ±2g，灵敏度 4096 LSB/g
+#define ACCEL_WAKE_SETTLE_MS 50  // 唤醒后等待首个有效样本的时间
+// 连续读到全零多少次就判定"疑似未唤醒"并如实打印，不再当成合法的 0g 数据。
+#define ACCEL_ZERO_STREAK_WARN 20
 
 // 麦克风输出的是"32 位帧内的 24 位数据"，必须按 32 位读再右移，
 // 按 16 位读会帧错位，得到对声音无反应的小幅乱跳。
@@ -54,18 +65,15 @@
 #define BUTTON_RETRY_MS    5000  // 上传失败后的重试节流
 #define BUTTON_RETRY_MAX   10    // 单条事件的重试上限，放弃后计入 queue_dropped
 
-// 【未实测，上板第一件事就是验证它】LED 引脚与有效电平。
-// ESP32-S3-EYE 的公开资料没有给出一致的板载 LED 引脚；GPIO21 在相机/LCD/SD
-// 的已知引脚表之外，大概率空闲，但没有实测依据。若上板发现 21 号没反应：
-//   1) 用万用表/试灯确认板载 LED 实际接在哪个 GPIO；
-//   2) 或外接一只 LED（串 330Ω）到任意空闲 GPIO，改这两个宏即可。
-// 其余逻辑不依赖具体引脚：按键、上报、指令通道全部与 LED 无关。
-#define PIN_LED            21
-#define LED_ON_LEVEL       HIGH  // 若 LED 常亮不灭，说明是低有效，改成 LOW
-// 上面两个宏在真机上验证过之后把它改成 1。notify 指令的回执会带上这个标志
-// （led_pin_note=pin_unverified），于是"界面显示成功但灯其实没亮"这种事
-// 在数据里就有痕迹，不会只在佩戴者嘴里。
-#define PIN_LED_VERIFIED   0
+// LED 引脚与有效电平：已与官方 BSP(esp-bsp/bsp/esp32_s3_eye) 核对——
+// BSP_LED_1_IO = GPIO_NUM_3，BSP_LED_1_LEVEL = true（高电平点亮）。
+// 此前用的 GPIO21 是错的：那是 LCD 的 PCLK（BSP_LCD_PCLK），所以按键时灯不亮。
+// 板载 LED 是 GPIO 型单色灯，直接 digitalWrite 即可，不需要 WS2812 驱动。
+#define PIN_LED            3
+#define LED_ON_LEVEL       HIGH
+// 引脚来源为官方 BSP 定义，不再是"猜测的空闲脚"，故标记为已验证。
+// notify 指令回执带的 led_pin_note 也会随之不再报 pin_unverified。
+#define PIN_LED_VERIFIED   1
 
 #define FW_VERSION          "0.3.0"
 

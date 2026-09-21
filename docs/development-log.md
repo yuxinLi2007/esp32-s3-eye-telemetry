@@ -542,15 +542,15 @@ enum 白名单**必须在服务端**：`decision` 会被拼进 claim 的文本�
 且查询前要先跑 `commands.sweep()`。换来的好处是——按键面板上看到的指令状态
 与指令面板上看到的**永远是同一个答案**，不会出现"这边显示成功、那边显示超时"。
 
-**一处没法验证的东西，就让它自己说话：`PIN_LED_VERIFIED`.**
+**一处没法验证的东西，就让它自己说话：`PIN_LED_VERIFIED`（已兑现）。**
 
-`PIN_LED=21` / `LED_ON_LEVEL=HIGH` 是照常见资料写的，**没有实物确认**
-（ESP32-S3-EYE 板载 LED 的引脚号在不同版本的资料里本来就不一致，有的批次干脆没有）。
-不想让"界面显示成功、灯其实没亮"这种事静默存在，于是在 `config.h` 立了个开关：
-`PIN_LED_VERIFIED=0` 时，notify 回执带 `led_pin_note="pin_unverified"`，
-一路显示到 Web 的结果摘要里。核对通过后改成 1、`FW_VERSION` → `0.3.1` 即可。
-这是第1周"不确定就实测"那条准则在**暂时没条件实测**时的降级版本：
-不能实测，至少让"未验证"这个状态在数据流里可见，而不是只写在注释里。
+第一版按常见资料写 `PIN_LED=21`，立了 `PIN_LED_VERIFIED=0`：
+为 0 时 notify 回执带 `led_pin_note="pin_unverified"`，一路显示到 Web 的结果摘要里。
+这是"不确定就实测"在暂时没条件实测时的降级版本——至少让"未验证"可见。
+
+**2026-09-21 上板兑现**：GPIO21 是 LCD 像素时钟，板载 LED 实为 `GPIO3`、高电平点亮。
+已改 `PIN_LED=3` / `PIN_LED_VERIFIED=1`，按 BOOT 单闪实测通过。
+真机端到端见下表更新。
 
 ### 验证
 
@@ -560,7 +560,7 @@ enum 白名单**必须在服务端**：`decision` 会被拼进 claim 的文本�
 | `tools/command_sim.py` | **169 断言全通过**（新增 S11 按键闭环 26 条：上报 201/幂等 200、换 `boot_id` 后 seq=0 再来一条、respond 去重、`bad_decision`、claim 文本协议、done 回执回显、重发、cancel、`queue_dropped` 透传） |
 | `tools/ui_check.mjs` | 第1、2周检查无回归；`notify` 的 decision 枚举框 = `ack/cancel`；按键面板渲染出真实事件行；连点 3 次「回应」→ **1 次 POST** 且 `client_token` 唯一 |
 | `pio run` | 编译通过，RAM 17.7% / Flash 27.7% |
-| 真机端到端 | **未做**。见 `week3-button.md` 的「上板验证清单」——第一件事是确认 GPIO21 上到底有没有 LED |
+| 真机端到端 | **已做**（2026-09-21）：`PIN_LED=3` 上板核实，按 BOOT 本地单闪、事件上报、Web 回应/取消闭环均通 |
 
 ---
 
@@ -777,11 +777,11 @@ S12 里“无令牌回应必须 401”这条，在一个没设 `CONTROL_TOKEN` �
   progress 就能无限续命。目前靠固件不再重跑来规避，服务端侧没有兜底。
 - **固件侧零单测**：`split_claim` 与手拼 JSON 这两个 bug 都出在纯函数上，
   本来最容易在 PC 上测（host-based unit test），却只能靠真机暴露。
-- **加速度计三轴偏置未校准**：静止时 |a|≈1.67 而非 1.0，`selftest` 恒判
-  `accel_out_of_range`。第1周遗留，需要在 `sensors.cpp` 加零偏标定。
-- **`PIN_LED=21` / `LED_ON_LEVEL=HIGH` 未在硬件上确认**（阶段 14）。
-  `PIN_LED_VERIFIED=0` 时 notify 回执带 `led_pin_note="pin_unverified"`，
-  界面因此能看见"这次成功可能没真闪灯"。上板核对后改成 1、`FW_VERSION` → `0.3.1`。
+- **加速度计**：三轴恒零的根因是 QMA6100P 上电默认 suspend，已修（唤醒 bit7 需写 `0xC0` 再写 `0x80`
+  才被接受）；静态 |a|≈1.03，量纲正确。三轴偏置仍未做零偏标定，`selftest` 的
+  `accel_out_of_range` 阈值偏紧，第1周遗留。
+- **`PIN_LED` 已上板核实为 `GPIO3`（高电平点亮）**，`PIN_LED_VERIFIED=1`，阶段 14 的
+  `pin_unverified` 隐患已关闭。
 - **物理反馈只有 LED**。佩戴场景更该用振动马达或蜂鸣器；`button_play_decision()`
   已经是"按 decision 播一段物理图案"的抽象，换执行器只改这一个函数 + `config.h`。
 - **按键只有一种语义**（按一下 = 一次待回应事件），没有长按/双击/组合键。

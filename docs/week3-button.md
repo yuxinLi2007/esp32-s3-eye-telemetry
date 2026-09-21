@@ -255,32 +255,29 @@ void loop() {
 上报接受 **200 或 201**：200 意味着幂等命中——之前那次"失败"的上传其实到了
 （超时但服务端已写库）。这正是幂等键存在的意义，板端把它当成功处理并打印说明。
 
-### 4.5 ⚠ `PIN_LED=21` / `LED_ON_LEVEL=HIGH` **尚未在硬件上验证**
+### 4.5 `PIN_LED` / `LED_ON_LEVEL` 已上板核实
 
-这是本周唯一一处**靠猜**的地方，必须在板子接上后第一件事就核对：
+2026-09-21 真机核对结果：**`PIN_LED=3`、`LED_ON_LEVEL=HIGH`**。
 
-- ESP32-S3-EYE 的板载 LED 引脚号在不同批次/版本文档里写法不一（21 / 48 / 无板载 LED），
-  本次按常见资料取 `GPIO21`，**没有实物确认**。
-- 有效电平同样未确认：若是低有效，现象是"LED 常亮、闪的时候反而灭"。
-- 因此 `config.h` 里立了一个开关：
+原先按常见资料写的 `GPIO21` 是错的——查 esp-bsp 的 `bsp/esp32_s3_eye/esp32_s3_eye.json`
+可得 `"BSP_LEDS_TYPE":"GPIO"`、`"BSP_LED_1_IO":"GPIO_NUM_3"`、`"BSP_LED_1_LEVEL":"true"`：
+板载 LED 是普通 GPIO 型、高电平点亮，`digitalWrite` 直接驱动即可。
+而 GPIO21 实际是 `BSP_LCD_PCLK`（LCD 像素时钟），所以旧固件按 BOOT 时灯根本没反应。
 
 ```c
-#define PIN_LED_VERIFIED   0   // 硬件核对通过后改成 1
+#define PIN_LED            3
+#define PIN_LED_VERIFIED   1   // 已上板核实
 ```
 
-`PIN_LED_VERIFIED=0` 时，notify 回执里带 `led_pin_note="pin_unverified"`，
-一路显示到 Web 指令面板的结果摘要里。也就是说：**在引脚核对之前，
-界面上每一次"成功"都自带一句"灯可能没真亮"的免责说明**，
-不会出现"服务端说成功、佩戴者其实什么也没看到"却没人知道的情况。
+`PIN_LED_VERIFIED=1` 后，notify 回执不再带 `led_pin_note="pin_unverified"`。
 
-如果 GPIO21 上没有 LED，改用外接 LED（串 220Ω～1kΩ 电阻到 GND）
-或把 `PIN_LED` 改成实测引脚，然后：改 `PIN_LED_VERIFIED=1`、
-`FW_VERSION` → `0.3.1`、重新烧写。
+上电单闪（100/100 ×1）现在就是"LED 到底接没接对"的第一秒自检：
+插上板子若看不到这一闪，先查 LED 引脚而不是查网络。
 
 ### 4.6 回执
 
 ```json
-{"decision":"ack","event_id":7,"led_feedback":true,"led_pin_note":"pin_unverified"}
+{"decision":"ack","event_id":7,"led_feedback":true}
 ```
 
 `decision` 非法时不放任何图案，直接 `post_failed(..., "bad_param", ...)`。
@@ -483,7 +480,7 @@ pio run                              # 编译；烧写：pio run -t upload
 
 | # | 检查 | 期望 | 不符时怎么办 |
 | --- | --- | --- | --- |
-| 1 | 上电后 1 秒内 LED | 单闪一次 | 完全没亮 → `PIN_LED` 不是 21，逐个试 48/其他，或外接 LED |
+| 1 | 上电后 1 秒内 LED | 单闪一次（已实测：GPIO3） | 没亮 → 先查串口是否到 `[btn] 按键通道就绪`，再查 `PIN_LED` |
 | 2 | LED 常亮不灭 | 不应出现 | 低有效 → `LED_ON_LEVEL` 改 `LOW` |
 | 3 | 按 BOOT 键 | 立刻单闪，串口 `[btn] 按下 seq=…` | 一次按压打出多条 seq → 加大 `BUTTON_DEBOUNCE_MS` |
 | 4 | 串口 `[btn] 上传成功 seq=… HTTP 201` | 201（重发时 200） | 401 → `secrets.h` 的 `INGEST_TOKEN` 与服务端不一致 |
@@ -491,14 +488,15 @@ pio run                              # 编译；烧写：pio run -t upload
 | 6 | 网页点「回应」 | 最坏 2s 后两下慢闪；指令 → 成功 | 30s 后 expired → 设备没在 claim（检查 Wi-Fi / `COMMAND_POLL_MS`） |
 | 7 | 网页点「取消」 | 六下快闪 | |
 | 8 | 断网按键 12 次再联网 | 上来的事件里带 `queue_dropped`，界面显示「板上曾丢弃 N 次」 | 一条不丢也不记账 → 队列/记账逻辑有问题 |
-| 9 | notify 回执里的 `led_pin_note` | `verified` | 仍是 `pin_unverified` → 1、2 两项确认无误后把 `PIN_LED_VERIFIED` 改 1，`FW_VERSION` → `0.3.1` |
+| 9 | notify 回执里的 `led_pin_note` | 不出现（`PIN_LED_VERIFIED=1` 已核实） | 仍带 `pin_unverified` → `config.h` 未改成 1 |
 
 ---
 
 ## 仍未解决 / 下一步
 
-1. **LED 引脚与有效电平未在硬件上确认**（4.5）。这是本周最大的未知，
-   已经用 `PIN_LED_VERIFIED` + `led_pin_note` 把"没确认"这件事显式地带到了界面上，
+1. ~~**LED 引脚与有效电平未在硬件上确认**（4.5）~~ **已于 2026-09-21 上板关闭**：
+   实测为 `GPIO3` / 高电平点亮，`PIN_LED_VERIFIED=1`。原降级方案
+   （`PIN_LED_VERIFIED` + `led_pin_note` 把"没确认"带到界面上）已完成使命，
    但真正的确认只能靠上板。
 2. **反馈只有 LED**。佩戴场景下更合适的是振动马达或蜂鸣器；
    `button_play_decision()` 已经是"按 decision 播放一段物理图案"的抽象，

@@ -295,7 +295,9 @@ def test_create_requires_control_token(client, monkeypatch):
 
 def test_ops_catalog_is_single_source_for_frontend(client):
     body = client.get("/api/v1/commands/ops").json()
-    assert {o["op"] for o in body["ops"]} == {"ping", "selftest", "capture"}
+    # 第3周：notify 加入清单。这个断言刻意写死全集——ops 清单是前端渲染表单的
+    # 唯一来源，谁往 OPS 里加了东西，都必须在这里显式承认一次。
+    assert {o["op"] for o in body["ops"]} == {"ping", "selftest", "capture", "notify"}
     cap = [o for o in body["ops"] if o["op"] == "capture"][0]
     assert {p["name"] for p in cap["params"]} == {"n", "interval_ms"}
     assert body["max_capture_duration_ms"] == commands.MAX_CAPTURE_DURATION_MS

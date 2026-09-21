@@ -69,6 +69,11 @@ def can_transition(src, dst):
 # ---------------------------------------------------------------- 指令集
 INT = "int"
 BOOL = "bool"
+# 第3周新增：白名单字符串（只能取 enum 里的值）。
+# 刻意不做"任意字符串"：领取应答是 `k=v;k=v` 纯文本协议，
+# 分隔符 | ; = 绝不能有机会出现在参数值里。enum 白名单让这一点
+# 在编码之前就被结构性地保证，而不是靠转义去补救。
+STR = "str"
 
 # 单次采集最长 10 秒。这不是拍的数：capture 与连续采集共用同一个主循环，
 # 采集期间板子不会上传，全靠环形缓冲扛着。RING_CAPACITY=240 @20Hz = 12 秒，
@@ -96,6 +101,20 @@ OPS = {
         "ttl_ms": 30_000,
         "timeout_ms": 20_000,
         "desc": "立即采集：按给定间隔真实读取传感器 N 次，样本带 request_id 入库",
+    },
+    # 第3周：按键事件的回传。Web 对一次按键作出回应(ack)或取消(cancel)时，
+    # buttons.respond() 生成这条指令，设备领取后播放对应的本地物理反馈。
+    # event_id 仅用于回执里交叉引用（0 表示手动测试，不关联任何按键事件），
+    # 事件状态的更新在 respond 时就完成了，不依赖这条指令的结果——
+    # 指令 expired/timeout 时界面照实显示，不会假装设备收到了。
+    "notify": {
+        "params": {
+            "decision": {"kind": STR, "enum": ("ack", "cancel"), "default": "ack"},
+            "event_id": {"kind": INT, "lo": 0, "hi": 1 << 40, "default": 0},
+        },
+        "ttl_ms": 30_000,
+        "timeout_ms": 15_000,
+        "desc": "按键回应通知：设备按 decision 播放 LED 反馈（ack=回应，cancel=取消）",
     },
 }
 
@@ -295,6 +314,13 @@ def _coerce(spec, name, value):
         if isinstance(value, bool):
             return value
         raise CommandError("参数 %s 必须是布尔值，收到 %r" % (name, value), "bad_param")
+    if kind == STR:
+        allowed = spec.get("enum") or ()
+        if isinstance(value, str) and value in allowed:
+            return value
+        raise CommandError(
+            "参数 %s 只能是 %s 之一，收到 %r" % (name, "/".join(allowed), value),
+            "bad_param")
     raise CommandError("未知参数类型 %s" % kind, "bad_param")
 
 
@@ -895,7 +921,10 @@ def ops_catalog():
         params = []
         for pname, p in spec["params"].items():
             params.append({"name": pname, "kind": p["kind"], "lo": p.get("lo"),
-                           "hi": p.get("hi"), "default": p.get("default")})
+                           "hi": p.get("hi"), "default": p.get("default"),
+                           # 第3周：字符串参数把白名单一并交给前端渲染成下拉框，
+                           # 前端照旧不另抄一份取值范围。
+                           "choices": list(p["enum"]) if p["kind"] == STR else None})
         out.append({"op": name, "desc": spec["desc"], "params": params,
                     "ttl_ms": spec["ttl_ms"], "timeout_ms": spec["timeout_ms"],
                     "max_capture_duration_ms": MAX_CAPTURE_DURATION_MS

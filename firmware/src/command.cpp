@@ -2,6 +2,7 @@
 
 #include <WiFi.h>
 
+#include "button.h"    // 第3周：notify 指令的本地物理反馈由按键模块播放
 #include "config.h"
 #include "sensors.h"
 #include "uplink.h"
@@ -54,6 +55,10 @@ struct Command {
   long n;
   long interval_ms;
   uint32_t timeout_ms;
+  // 第3周 notify 专用。所有 op 共用一个结构：字段闲置几个字节，
+  // 换来的是"解析只有一处"——按 op 分结构体就要在 parse_claim 里分叉。
+  char decision[8];    // "ack" / "cancel"（服务端白名单保证不会有别的值）
+  long event_id;       // 关联的按键事件 id，0 = 手动测试
 };
 
 static DeviceSnapshot snap() {
@@ -200,6 +205,13 @@ static bool parse_claim(const String &body, Command &out) {
       String k = item.substring(0, eq), v = item.substring(eq + 1);
       if (k == "n") out.n = v.toInt();
       else if (k == "interval_ms") out.interval_ms = v.toInt();
+      else if (k == "decision") {
+        // 值来自服务端的 enum 白名单（ack/cancel），不可能带分隔符；
+        // 仍然截断保护：万一协议变了，最坏是 run_notify 报 bad_param，不是溢出。
+        strncpy(out.decision, v.c_str(), sizeof(out.decision) - 1);
+        out.decision[sizeof(out.decision) - 1] = '\0';
+      }
+      else if (k == "event_id") out.event_id = v.toInt();
       // 不认识的参数直接忽略：服务端加参数不该让老固件崩掉，
       // 但也不能假装执行了——所以最终回执里会带上固件版本，人对得上号。
     }
@@ -608,6 +620,30 @@ static void run_capture(const Command &c) {
   }
 }
 
+// ------------------------------------------------------------------ notify
+// 第3周：Web 对一次按键的回应/取消。这是全链路里最简单的指令，
+// 但顺序很讲究：先播反馈、后回执——回执 done 的含义是"图案已经放完"，
+// 而不是"指令收到了"。反过来的话，界面上的"成功"可能发生在
+// 佩戴者还什么都没看见的时刻，那个成功就是假的。
+static void run_notify(const Command &c) {
+  if (!button_play_decision(c.decision, idle)) {
+    char msg[96];
+    snprintf(msg, sizeof(msg), "decision 非法：%s（应为 ack/cancel）",
+             c.decision[0] ? c.decision : "(空)");
+    post_failed(c.request_id, "bad_param", msg, String());
+    return;
+  }
+  String r;
+  r.reserve(192);
+  r += "{";
+  add_str(r, "decision", c.decision);
+  add_num(r, "event_id", "%ld", (double)c.event_id);
+  add_bool(r, "led_feedback", true);
+  add_str(r, "led_pin_note", PIN_LED_VERIFIED ? "verified" : "pin_unverified");
+  r += "}";
+  post_done(c.request_id, r, -1, -1);
+}
+
 // ------------------------------------------------------------------ 调度
 static void run_command(const Command &c) {
   g_executing = true;
@@ -620,6 +656,7 @@ static void run_command(const Command &c) {
   if (strcmp(c.op, "ping") == 0)            run_ping(c);
   else if (strcmp(c.op, "selftest") == 0)   run_selftest(c);
   else if (strcmp(c.op, "capture") == 0)    run_capture(c);
+  else if (strcmp(c.op, "notify") == 0)     run_notify(c);
   else {
     // 服务端加了新 op 而固件没更新：报 unsupported_op，让界面上出现一条明确
     // 的失败，而不是让用户盯着"执行中"等到超时——那种失败看不出是固件太旧。

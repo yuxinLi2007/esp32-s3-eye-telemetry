@@ -45,7 +45,29 @@
 // 所以这个值只影响"下发到开始执行"的排队时延，不影响执行本身。
 #define COMMAND_POLL_MS     2000
 
-#define FW_VERSION          "0.2.0"
+// ---- 第3周：按键与物理反馈 ----
+// PIN_BUTTON 用 GPIO0（BOOT 键）：这是板上唯一一个有实体按键、且引脚号
+// 确定的 GPIO（低有效，按下接地）。佩戴场景不需要额外接按钮。
+#define PIN_BUTTON         0
+#define BUTTON_DEBOUNCE_MS 30    // 机械键抖动实测 5~20ms，取 30ms 留余量
+#define BUTTON_QUEUE       8     // 待传按键队列：断网期间按下的键先存在板上
+#define BUTTON_RETRY_MS    5000  // 上传失败后的重试节流
+#define BUTTON_RETRY_MAX   10    // 单条事件的重试上限，放弃后计入 queue_dropped
+
+// 【未实测，上板第一件事就是验证它】LED 引脚与有效电平。
+// ESP32-S3-EYE 的公开资料没有给出一致的板载 LED 引脚；GPIO21 在相机/LCD/SD
+// 的已知引脚表之外，大概率空闲，但没有实测依据。若上板发现 21 号没反应：
+//   1) 用万用表/试灯确认板载 LED 实际接在哪个 GPIO；
+//   2) 或外接一只 LED（串 330Ω）到任意空闲 GPIO，改这两个宏即可。
+// 其余逻辑不依赖具体引脚：按键、上报、指令通道全部与 LED 无关。
+#define PIN_LED            21
+#define LED_ON_LEVEL       HIGH  // 若 LED 常亮不灭，说明是低有效，改成 LOW
+// 上面两个宏在真机上验证过之后把它改成 1。notify 指令的回执会带上这个标志
+// （led_pin_note=pin_unverified），于是"界面显示成功但灯其实没亮"这种事
+// 在数据里就有痕迹，不会只在佩戴者嘴里。
+#define PIN_LED_VERIFIED   0
+
+#define FW_VERSION          "0.3.0"
 
 // 必须明显小于服务端 db.NTP_FRESH_THRESHOLD_S(300 秒)。
 // 原值 30 分钟远大于 300 秒，实测导致同步年龄一路上涨、3000 个样本全部被判成

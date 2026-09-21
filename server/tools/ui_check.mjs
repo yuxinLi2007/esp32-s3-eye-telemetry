@@ -140,10 +140,20 @@ await new Promise(r => setTimeout(r, 1600));
 console.log('\n--- 远程指令面板 ---');
 const opsBox = get('cmd_ops');
 const btns = opsBox.children.filter(c => c.tagName === 'button');
-const inps = opsBox.children.filter(c => c.tagName === 'input');
+// input 是数值参数，select 是枚举参数（notify 的 decision 就走 select）
+const inps = opsBox.children.filter(c => c.tagName === 'input' || c.tagName === 'select');
 if (!btns.length) fail('一个指令按钮都没渲染出来（/commands/ops 没取到？）');
 console.log('按钮:', btns.map(b => b.textContent + (b.disabled ? '(禁用)' : '')).join('  '));
-for (const i of inps) console.log('  参数框', i.id, '=', i.value, ' 范围', i.min, '~', i.max);
+for (const i of inps) {
+  if (i.tagName === 'select') {
+    const opts = (i.children || []).map(o => o.value || o.textContent);
+    console.log('  枚举框', i.id, '=', i.value, ' 可选', opts.join('/'));
+    if (i.id === 'cmd_p_decision' && opts.join('/') !== 'ack/cancel')
+      fail('notify 的 decision 枚举不对：' + opts.join('/'));
+  } else {
+    console.log('  参数框', i.id, '=', i.value, ' 范围', i.min, '~', i.max);
+  }
+}
 console.log('统计栏:', txt(get('cmd_stats')));
 
 const rows = get('cmd_tbody').children;
@@ -170,3 +180,81 @@ if (posts.length !== 1) fail('期望 1 次，实际 ' + posts.length + ' 次（�
 console.log('提示栏:', txt(get('cmd_note')));
 console.log('按钮恢复可用:', btns.every(b => !b.disabled) ? '（下一次点击是新意图）' : 'FAIL 仍禁用');
 console.log('OK: 前端防抖生效');
+// ================= 第3周：按键事件面板 =================
+// 这一段盯的是三件肉眼最容易放过去的事：
+//   1. 事件行到底渲染出来没有——没事件时也必须有一行明确的空态提示，
+//      而不是一片空白（空白和"面板挂了"看起来一模一样）；
+//   2. 连点三次「回应」会不会让设备闪两遍灯：数 POST 次数 + 比对 client_token，
+//      两件事都成立才叫幂等；
+//   3. 指令状态是不是跟着行一起显示的（前端不存副本，另一个标签页回应了这里也能看到）。
+const BTN_JS = new URL('../static/button.js', import.meta.url);
+const btnCode = fs.readFileSync(BTN_JS, 'utf8');
+
+const btnPosts = [];                  // 只数 respond 这一个端点，2s 轮询的 GET 不算
+const stubFetch2 = globalThis.fetch;
+globalThis.fetch = (u, o) => {
+  if (o && o.method === 'POST' && String(u).includes('/api/v1/button/events')) {
+    let tok = null;
+    try { tok = JSON.parse(o.body || '{}').client_token; } catch (e) { /* 断言里会报 */ }
+    btnPosts.push({ url: String(u), token: tok });
+  }
+  return stubFetch2(u, o);
+};
+
+new Function(btnCode)();
+await new Promise(r => setTimeout(r, 1600));
+
+console.log('\n--- 按键事件面板 ---');
+console.log('统计栏:', txt(get('btn_stats')));
+const brows = get('btn_tbody').children;
+if (!brows.length) fail('按键面板一行都没渲染出来（连空态提示都没有）');
+const emptyState = brows.length === 1 && brows[0].children.length === 1 &&
+                   brows[0].children[0].colSpan > 0;
+if (emptyState) {
+  console.log('空态提示:', txt(brows[0].children[0]));
+} else {
+  console.log('表格行数:', brows.length);
+  for (const tr of brows.slice(0, 6)) {
+    const td = tr.children;
+    if (td.length < 7) { console.log('  ', txt(td[0])); continue; }
+    const st = td[4].children[0], cm = td[5].children[1];
+    console.log('  ', txt(td[1]).padEnd(12), '|', txt(td[2]).slice(0, 22).padEnd(22),
+      '|', (st ? st.className : '').padEnd(12), txt(st).padEnd(6),
+      '|', txt(td[5]).slice(0, 34).padEnd(34), '|', txt(td[6]).slice(0, 16));
+  }
+}
+console.log('提示栏:', txt(get('btn_note')) || '（空）');
+
+// --- 回应防抖 + 幂等键断言：连点三次「回应」，服务端只应收到一次 POST，且 token 唯一 ---
+const acks = [];
+for (const tr of brows) for (const td of tr.children) for (const c of td.children)
+  if (c.tagName === 'button' && c.textContent === '回应') acks.push(c);
+
+if (!acks.length) {
+  console.log('\n--- 回应防抖断言 ---');
+  console.log('SKIP: 当前没有待回应事件（先 POST /api/v1/button 造一条再跑这一段）');
+} else {
+  // confirm 全局桩是 false（撤销是危险动作）。这里只点「回应」，而且只对这个
+  // origin 生效，所以临时放开；点完立刻还原。
+  const confirmStub = window.confirm;
+  window.confirm = () => true;
+  btnPosts.length = 0;
+  acks[0].onclick(); acks[0].onclick(); acks[0].onclick();
+  await new Promise(r => setTimeout(r, 1500));
+  window.confirm = confirmStub;
+
+  console.log('\n--- 回应防抖断言 ---');
+  console.log('连点 3 次「回应」→ 实际 POST respond 次数:', btnPosts.length);
+  if (btnPosts.length !== 1)
+    fail('期望 1 次，实际 ' + btnPosts.length + ' 次（前端防抖失效，设备会闪两遍灯）');
+  const tok = btnPosts[0].token;
+  if (!tok || !String(tok).startsWith('web-'))
+    fail('client_token 缺失或不是 web- 前缀: ' + JSON.stringify(tok));
+  console.log('幂等键:', tok, ' →', btnPosts[0].url);
+  console.log('提示栏:', txt(get('btn_note')));
+  const after = get('btn_tbody').children;
+  const stillAck = [...after].some(tr => (tr.children[6]?.children || [])
+    .some(c => c.tagName === 'button' && c.textContent === '回应' && c.disabled));
+  console.log('回应后按钮态:', stillAck ? 'FAIL 仍在等待且禁用' : '已恢复（下一次点击是新意图）');
+  console.log('OK: 回应防抖 + 幂等键生效');
+}

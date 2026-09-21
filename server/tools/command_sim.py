@@ -247,13 +247,21 @@ def s0_catalog():
     if code != 200:
         return
     ops = {o["op"]: o for o in body["ops"]}
-    ck("白名单恰好是 ping/selftest/capture", set(ops) == {"ping", "selftest", "capture"},
-       sorted(ops))
+    # 第3周：notify 加入白名单（按键回应通知）
+    ck("白名单恰好是 ping/selftest/capture/notify",
+       set(ops) == {"ping", "selftest", "capture", "notify"}, sorted(ops))
     ck("max_live_per_device = 8", body["max_live_per_device"] == 8, body["max_live_per_device"])
     ck("max_capture_duration_ms = 10000", body["max_capture_duration_ms"] == 10000,
        body["max_capture_duration_ms"])
     cap = {p["name"]: p for p in ops["capture"]["params"]}
     ck("n 的范围由服务端给出 1..200", (cap["n"]["lo"], cap["n"]["hi"]) == (1, 200), cap["n"])
+    if "notify" in ops:
+        ntf = {p["name"]: p for p in ops["notify"]["params"]}
+        ck("notify.decision 的白名单由服务端给出 (ack/cancel)",
+           ntf["decision"]["kind"] == "str" and ntf["decision"]["choices"] == ["ack", "cancel"],
+           ntf["decision"])
+        ck("notify.event_id 由服务端给出范围", ntf["event_id"]["kind"] == "int",
+           ntf["event_id"])
     ck("interval_ms 的范围由服务端给出 10..1000",
        (cap["interval_ms"]["lo"], cap["interval_ms"]["hi"]) == (10, 1000), cap["interval_ms"])
 
@@ -706,6 +714,198 @@ def finish_slow(s):
     ck_err("  错误码 = already_terminal", res, "already_terminal")
 
 
+# ---------------------------------------------------------------- 第3周：按键闭环
+def s11_button_loop():
+    print("\n[S11] 第3周按键闭环：上报 -> 幂等 -> Web 回应 -> notify 领取 -> done -> 回显")
+    mac = new_mac()
+    sim = Sim(mac, fw="0.3.0-sim")
+    boot = sim.boot_id
+
+    def press(seq, **kw):
+        body = {"device_mac": mac, "boot_id": boot, "press_seq": seq,
+                "fw_version": sim.fw, "t_press_uptime_ms": 4242 + seq,
+                "ntp_synced": True, "ntp_sync_age_s": 12,
+                "t_device_ntp_ms": int(time.time() * 1000), "queue_dropped": 0}
+        body.update(kw)
+        return req("POST", "/api/v1/button", body, token="ingest")
+
+    code, body, hdr = press(0)
+    ck("按键上报返回 201（新事件）", code == 201, err(body))
+    eid = body["event"]["id"]
+    ck("响应头 x-deduped: 0", hdr.get("X-Deduped") == "0", hdr.get("X-Deduped"))
+    ck("事件初始状态 received", body["event"]["state"] == "received", body["event"])
+
+    code, body, hdr = press(0)   # 板端重试（比如第一次响应丢在半路）
+    ck("同 (mac,boot,seq) 重发返回 200 + x-deduped: 1", code == 200 and
+       hdr.get("X-Deduped") == "1", (code, hdr.get("X-Deduped")))
+    ck("重发拿回的是同一条事件", body["event"]["id"] == eid, body["event"])
+
+    code, body, _ = press(0, boot_id="BOOTX999")
+    ck("换了 boot_id 就是新事件（重启后 seq 归零不冲突）", code == 201, err(body))
+
+    code, body, _ = req("GET", "/api/v1/button/events?limit=50")
+    ck("事件列表可读", code == 200, code)
+    evs = [e for e in body["events"] if e["device_mac"] == mac]
+    ck("列表里有本场景的两条事件", len(evs) == 2, len(evs))
+
+    # Web 回应：生成 notify 指令
+    code, body, hdr = req("POST", "/api/v1/button/events/%d/respond" % eid,
+                          {"decision": "ack", "client_token": mk_token("s11a")},
+                          token="control")
+    ck("回应返回 201", code == 201, err(body))
+    rid = body["command"]["request_id"]
+    ck("生成的是 op=notify 的指令", body["command"]["op"] == "notify", body["command"])
+    ck("指令参数 decision=ack, event_id=%d" % eid,
+       body["command"]["params"] == {"decision": "ack", "event_id": eid},
+       body["command"]["params"])
+    ck("事件行已更新为 acked 并记住 request_id",
+       body["event"]["state"] == "acked" and body["event"]["request_id"] == rid,
+       body["event"])
+
+    code, body2, _ = req("POST", "/api/v1/button/events/%d/respond" % eid,
+                         {"decision": "ack", "client_token": mk_token("s11a")},
+                         token="control")
+    ck("同一 client_token 重发被去重（200 + 同一条指令）",
+       code == 200 and body2["command"]["request_id"] == rid, (code, body2))
+
+    code, body, _ = req("POST", "/api/v1/button/events/%d/respond" % eid,
+                        {"decision": "nope"}, token="control")
+    ck_err("非法 decision 被拒（bad_decision）", body, "bad_decision")
+
+    # 设备领取：走固件口径的纯文本协议解析
+    j = sim.claim()
+    ck("设备领到的正是这条 notify", j is not None and j["request_id"] == rid, j)
+    if j:
+        ck("领取文本协议里带着 decision=ack", "decision=ack" in j["raw"], j["raw"])
+        ck("固件口径解析出的参数正确",
+           j["params"] == {"decision": "ack", "event_id": eid}, j["params"])
+        code, res, _ = sim.done(rid, result={"decision": "ack", "event_id": eid,
+                                             "led_feedback": True})
+        ck("notify 回执 done 被接受", code == 200, err(res))
+
+    # 回显：事件行上的指令状态必须变成 done（不另存副本，现查）
+    code, body, _ = req("GET", "/api/v1/button/events?limit=50")
+    ev = [e for e in body["events"] if e["id"] == eid][0]
+    ck("事件行回显 notify 指令状态 = done",
+       ev["command"] and ev["command"]["state"] == "done", ev["command"])
+    ck("回显里 is_terminal 为真（前端据此停止转圈）",
+       ev["command"]["is_terminal"] is True, ev["command"])
+
+    # 再回应一次（用户改主意/重发）：产生新指令，respond_count 增加
+    code, body, _ = req("POST", "/api/v1/button/events/%d/respond" % eid,
+                        {"decision": "cancel"}, token="control")
+    ck("再次回应生成新指令（201）", code == 201, err(body))
+    rid2 = body["command"]["request_id"]
+    ck("新指令 decision=cancel", body["command"]["params"]["decision"] == "cancel",
+       body["command"]["params"])
+    ck("respond_count 增到 2", body["event"]["respond_count"] == 2, body["event"])
+    j = sim.claim()
+    if j:
+        sim.done(j["request_id"], result={"decision": "cancel", "event_id": eid})
+
+    # 取消一条尚未回应的按键
+    code, body, _ = press(7)
+    eid2 = body["event"]["id"]
+    code, body, _ = req("POST", "/api/v1/button/events/%d/respond" % eid2,
+                        {"decision": "cancel", "client_token": mk_token("s11c")},
+                        token="control")
+    ck("cancel 回应生成 notify 指令", code == 201, err(body))
+    j = sim.claim()
+    ck("设备领到 cancel", j is not None and j["params"]["decision"] == "cancel", j)
+    if j:
+        sim.done(j["request_id"], result={"decision": "cancel", "event_id": eid2})
+
+    # 队列丢弃计数必须可见
+    code, body, _ = press(8, queue_dropped=3)
+    ck("queue_dropped 原样存回（板上丢过按键这件事不会被抹掉）",
+       code == 201 and body["event"]["queue_dropped"] == 3, body)
+
+
+def s12_button_anti_forge():
+    print("\n[S12] 第3周状态防伪：设备上报不能自封状态，状态跃迁只在服务端")
+    mac = new_mac()
+    sim = Sim(mac, fw="0.3.0-sim")
+    boot = sim.boot_id
+
+    # 1) 设备在上报里塞满"我已经被回应了"的字段，试图跳过人的确认。
+    #    服务端只从载荷里认它要的那几个字段（mac/boot/seq/...），
+    #    state/decision/request_id/id/t_server_ms 一律由服务端自己决定。
+    #    否则没人点过"回应"，界面上就会出现一行"已回应"。
+    forged = {
+        "device_mac": mac, "boot_id": boot, "press_seq": 100,
+        "fw_version": sim.fw, "state": "acked", "decision": "ack",
+        "request_id": "req_forged_000000", "id": 999999,
+        "t_server_ms": 1, "respond_count": 7, "decided_by": "attacker",
+        "queue_dropped": 0,
+    }
+    code, body, _ = req("POST", "/api/v1/button", forged, token="ingest")
+    ck("伪造 state=acked 的上报仍被收下（未知字段不该 500）", code == 201, err(body))
+    ev = body["event"]
+    ck("事件状态仍是服务端认定的 received（伪造的 acked 被忽略）",
+       ev["state"] == "received", ev["state"])
+    ck("伪造的 decision 未进库", ev["decision"] is None, ev["decision"])
+    ck("伪造的 request_id 未进库", ev["request_id"] is None, ev["request_id"])
+    ck("伪造的 respond_count=7 未进库", ev["respond_count"] == 0, ev["respond_count"])
+    ck("伪造的 t_server_ms=1 未进库（权威时间由服务端决定）",
+       ev["t_server_ms"] > 1_700_000_000_000, ev["t_server_ms"])
+    ck("伪造的 id=999999 未进库", ev["id"] != 999999, ev["id"])
+    eid = ev["id"]
+
+    # 2) 没令牌 = 既不能上报，也不能回应。
+    #    只在服务端真设了令牌时才断言 401：没设令牌的实例对任何人都是开放的，
+    #    那时"无令牌被拒"根本不成立，硬断言等于把环境问题报成代码问题。
+    if INGEST_TOKEN:
+        code, body, _ = req("POST", "/api/v1/button",
+                            {"device_mac": mac, "boot_id": boot, "press_seq": 101})
+        ck("无 X-Ingest-Token 上报被拒 401", code == 401, code)
+    else:
+        print("  SKIP  无 X-Ingest-Token 上报 401（本实例未设 INGEST_TOKEN）")
+    if CONTROL_TOKEN:
+        code, body, _ = req("POST", "/api/v1/button/events/%d/respond" % eid,
+                            {"decision": "ack"})
+        ck("无 X-Control-Token 回应被拒 401", code == 401, code)
+    else:
+        print("  SKIP  无 X-Control-Token 回应 401（本实例未设 CONTROL_TOKEN）")
+
+    # 3) decision 是 enum：不给"用分隔符注入 claim 参数段"留口子
+    code, body, _ = req("POST", "/api/v1/button/events/%d/respond" % eid,
+                        {"decision": "ack;event_id=1"}, token="control")
+    ck_err("decision 里塞分隔符被拒（bad_decision，注入不了参数段）",
+           body, "bad_decision")
+    code, body, _ = req("POST", "/api/v1/button/events/999999999/respond",
+                        {"decision": "ack"}, token="control")
+    ck("对不存在的事件回应 -> 404", code == 404, code)
+
+    # 4) 状态跃迁只在服务端：设备不能把一条指令自己置成 done
+    code, body, _ = req("POST", "/api/v1/button/events/%d/respond" % eid,
+                        {"decision": "ack", "client_token": mk_token("s12a")},
+                        token="control")
+    ck("回应生成 notify 指令 201", code == 201, err(body))
+    rid = body["command"]["request_id"]
+
+    code, res, _ = sim.done(rid, result={"led_feedback": True})
+    ck("设备对尚未领取的指令直接回执 done 被拒 409（不能自封完成）",
+       code == 409, (code, res))
+    ck("  错误码 = not_claimed", (res.get("error") or {}).get("code") == "not_claimed",
+       res)
+
+    j = sim.claim()
+    ck("设备正常领取到该指令", j is not None and j["request_id"] == rid, j)
+    if j:
+        code, res, _ = sim.done(rid, result={"led_feedback": True})
+        ck("领取后回执 done 被接受", code == 200, err(res))
+        code, res, _ = sim.done(rid, result={"led_feedback": True})
+        ck("已终态指令再收一次回执被拒 409（成功不能被重写）", code == 409, (code, res))
+        ck("  错误码 = already_terminal",
+           (res.get("error") or {}).get("code") == "already_terminal", res)
+
+    # 最终事实仍以事件行为准：只认服务端写进去的状态
+    code, body, _ = req("GET", "/api/v1/button/events?limit=50")
+    ev = [e for e in body["events"] if e["id"] == eid][0]
+    ck("事件行状态来自服务端：acked，且挂着真实指令",
+       ev["state"] == "acked" and ev["request_id"] == rid, ev)
+
+
 # ---------------------------------------------------------------- 入口
 def main():
     global URL
@@ -739,6 +939,8 @@ def main():
     s6_bad_receipts()
     s7_mismatch()
     s8_cancel()
+    s11_button_loop()
+    s12_button_anti_forge()
     if slow:
         finish_slow(slow)
 

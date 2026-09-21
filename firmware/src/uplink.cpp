@@ -6,13 +6,26 @@
 #include "config.h"
 #include "secrets.h"
 
+// 断网熔断：连续失败后短时间内不再发起新请求。
+// 否则一次断网会把主循环每一轮都用连接超时堵满——真机实测采样节拍被从
+// 2s 拖到 8s，连本地按键反馈都跟着卡（那是另一个 bug，已在 button.cpp 修）。
+// 退避 2s 起、失败翻倍、封顶 8s；任何一次成功立刻复位。
+static uint32_t g_down_until = 0;
+static uint32_t g_backoff_ms = 0;
+
 int uplink_post(const char *path, const String &body, const char *content_type,
                 String *resp, uint32_t timeout_ms) {
   if (WiFi.status() != WL_CONNECTED) return UPLINK_NO_WIFI;
 
+  // 熔断窗口内直接返回"没发出去"，调用方的失败处理与真断网完全一致：
+  // 事件留在队列里等恢复，不丢也不静默。
+  if (g_down_until != 0 && (int32_t)(millis() - g_down_until) < 0) {
+    return UPLINK_NO_WIFI;
+  }
+
   HTTPClient http;
   http.setTimeout(timeout_ms);
-  http.setConnectTimeout(3000);
+  http.setConnectTimeout(1500);
   String url = String(SERVER_URL) + path;
   if (!http.begin(url)) {
     Serial.printf("[uplink] http.begin 失败 url=%s\n", url.c_str());
@@ -27,6 +40,14 @@ int uplink_post(const char *path, const String &body, const char *content_type,
   int code = http.POST(body);
   if (resp) *resp = http.getString();
   http.end();
+
+  if (code <= 0) {
+    g_backoff_ms = g_backoff_ms ? (g_backoff_ms * 2 > 8000 ? 8000 : g_backoff_ms * 2) : 2000;
+    g_down_until = millis() + g_backoff_ms;
+  } else {
+    g_backoff_ms = 0;
+    g_down_until = 0;
+  }
   return code;
 }
 

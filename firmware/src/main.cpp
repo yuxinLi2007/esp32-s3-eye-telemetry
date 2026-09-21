@@ -21,6 +21,7 @@
 #include <esp_sntp.h>
 #include <time.h>
 
+#include "button.h"    // 第3周：按键事件与本地物理反馈（独立模块，本文件只接线）
 #include "command.h"   // 第2周：远程指令的领取与执行（独立模块，本文件只接线）
 #include "config.h"
 #include "secrets.h"
@@ -297,6 +298,11 @@ void setup() {
   // 第2周接线：把"现场取值"和"连续流节拍"两个回调交给指令模块。
   // 放在 sensors_begin 之后：自检/采集要用的传感器此时才真正就绪。
   command_begin(fill_snapshot, stream_tick);
+
+  // 第3周接线：按键模块复用同一个"现场取值"回调，设备身份与 NTP 事实
+  // 仍然只有 main 一份。button_begin 里会上电单闪一次 LED，
+  // 引脚接没接对在第一秒就看得见，不必等到第一次按键。
+  button_begin(fill_snapshot);
   Serial.printf("[cfg] 服务端=%s  采样=%dms  上传=%dms\n", SERVER_URL,
                 SAMPLE_INTERVAL_MS, UPLOAD_INTERVAL_MS);
   Serial.println("===== 开始采集 =====\n");
@@ -304,6 +310,9 @@ void setup() {
 
 void loop() {
   wifi_ensure();
+  // 第3周：按键扫描与本地 LED 反馈。刻意放在 WiFi 判断之外：
+  // 断网时"按下 -> 立刻闪灯"必须照常成立，上传排队等网络恢复。
+  button_poll();
   if (WiFi.status() == WL_CONNECTED) {
     ntp_ensure();
     control_poll();

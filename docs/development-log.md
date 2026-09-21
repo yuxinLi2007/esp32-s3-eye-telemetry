@@ -473,6 +473,230 @@ done 回执 422 失败 → 2 秒后幂等重领到同一条 → 从头再跑一�
 
 ---
 
+## 阶段 14 · 第3周：按键触发与物理反馈闭环
+
+设计与协议细节单独成文：[`week3-button.md`](week3-button.md)。这里只记坑与验证。
+
+**做了什么.** 把前两周的两条单向链路接成闭环：板上按键 → **本地立刻** LED 反馈（不等网络）
+→ 上报 VPS → Web 2 秒内出现该行 → 操作者点「回应/取消」→ 复用第2周指令通道下发
+`op=notify` → 设备播放对应图案 → 指令状态回到同一行。
+新增 `server/buttons.py`、`firmware/src/button.*`、`server/static/button.js`；
+`main.cpp` 只加两处接线（`button_begin` / loop 里 `button_poll()`，且放在 Wi-Fi 检查**之前**），
+`command.cpp` 只加一个 `run_notify()`。**没有新造任何一条通信链路**：
+notify 就是 `commands` 表里的一条普通指令，领取/状态机/超时/审计全部复用。
+
+**坑 1 · `from commands import now_ms` 是绑定副本，只 monkeypatch 一边，测试就成了时序彩票.**
+
+`buttons.py` 顶部 `from commands import now_ms`。fixture 里冻结时间时只打了
+`commands.now_ms`，`buttons.now_ms` 仍指向真实时钟——于是"事件 age"用假时间、
+"sweep 超时判定"用真时间，`expired` 相关断言时对时错。必须两边都 patch。
+根因是 from-import 把函数对象**复制**成了本模块的名字；这类"时间注入"应该走
+`monkeypatch.setattr(module, "now_ms", ...)` 逐个模块列清楚，别指望一处生效。
+
+**坑 2 · `commands.py` 原本假设"参数就是整数"，第一个字符串参数牵出四处改动.**
+
+OPS 的 `kind`、`_coerce` 的校验分支、`ops_catalog` 要吐 `choices`、
+前端 `renderOps`/`collectParams` 要能渲染下拉框——四处都长在同一个假设上。
+改完的收益是下一个带枚举参数的 op 只需要在 OPS 里加一行，前端一行都不用动。
+
+enum 白名单**必须在服务端**：`decision` 会被拼进 claim 的文本协议
+（`rid|notify|decision=ack;event_id=7|15000`），而那条协议正是用 `;` 和 `=` 分隔的——
+一个允许任意字符串的参数就等于允许伪造参数段。`_coerce` 拒掉不在 `choices` 里的值，
+板端解析处再加一道截断保护（最坏结果是 `bad_param` 回执，不是缓冲区溢出）。
+
+**坑 3 · node 桩里点 `.onclick()` 绕过了 `disabled`，防抖断言差点测了个假的.**
+
+第2周那段"连点 3 次只应有 1 次 POST"之所以成立，是因为 `commands.js` 里有一行
+**代码级**防抖 `if (busyOp) return;`，不只是把按钮设成 `disabled`。
+写 `button.js` 时我先只做了 DOM 级防抖（`render()` 里 `disabled = busy`）——
+在浏览器里看起来完全正确：第一次点击后按钮就灰了，点不动。
+但在 node 桩里直接调 `onclick()` 会绕过 `disabled`，三次点击变三次 POST。
+
+这不是"测试环境与真实环境不一致"，恰恰相反：**桩暴露了防抖只有一层**。
+真实浏览器里键盘回车连发、辅助功能点击、以及"渲染前的同一 tick 内多次触发"
+都能绕过 `disabled`。补上 `if (busyId !== null) return;`，两层都在，断言才有意义。
+
+**坑 4 · 空态那一行 `colSpan=8`，而表头只有 7 列.**
+
+小事，但"空态"是最少被看到、也最少被检查的界面状态。现在 `ui_check.mjs` 里
+空态也算一行（必须带 `colSpan > 0` 才算合法空态），"一片空白"直接判失败——
+空白和"面板挂了"长得一模一样，靠肉眼分不出来。
+
+**坑 5 · `respond()` 里"先建指令还是先改事件行"决定了这条记录能不能自愈.**
+
+若先更新事件行再创建指令，一旦 `commands.create()` 抛错（在飞已满 429、参数非法、
+数据库忙），库里就留下一条 `state=acked` 而 `request_id=NULL` 的事件——
+界面显示"已回应"，设备永远不会有反馈，而且没有任何入口能重来。
+现在的顺序是反的：指令创建失败 → 事件行原封不动 → 界面显示错误 → 用户重点一次即可。
+
+另一处细节：只有 `deduped=False` 时才 `respond_count+1`。计数是派生幂等键
+（`btn<id>-<decision>-r<count+1>`）的一部分，被网络重试刷上去就等于凭空造出"新意图"，
+设备会闪两遍灯。
+
+**一处刻意的取舍：事件状态不加"设备已确认".**
+
+`button_events.state` 只有 `received / acked / cancelled`，记的是"用户点了什么"。
+设备到底播放了没有，看 `request_id` 关联的那条指令（`done/failed/timeout/expired`）。
+存两份状态迟早漂移，而这里恰好有一份是权威的（`commands` 有完整事件溯源）。
+代价：`list_events` 每次多一条 `SELECT ... WHERE request_id IN (...)`，
+且查询前要先跑 `commands.sweep()`。换来的好处是——按键面板上看到的指令状态
+与指令面板上看到的**永远是同一个答案**，不会出现"这边显示成功、那边显示超时"。
+
+**一处没法验证的东西，就让它自己说话：`PIN_LED_VERIFIED`（已兑现）。**
+
+第一版按常见资料写 `PIN_LED=21`，立了 `PIN_LED_VERIFIED=0`：
+为 0 时 notify 回执带 `led_pin_note="pin_unverified"`，一路显示到 Web 的结果摘要里。
+这是"不确定就实测"在暂时没条件实测时的降级版本——至少让"未验证"可见。
+
+**2026-09-21 上板兑现**：GPIO21 是 LCD 像素时钟，板载 LED 实为 `GPIO3`、高电平点亮。
+已改 `PIN_LED=3` / `PIN_LED_VERIFIED=1`（结论来自官方 BSP 清单）。
+真机端到端见下表更新。
+
+### 验证
+
+| 命令 | 结果 |
+|---|---|
+| `pytest -q`（全量） | **128 passed**（27 第1周 + 80 第2周 + 23 新增 `test_buttons.py`；`test_commands.py` 的 op 集合断言已含 `notify`） |
+| `tools/command_sim.py` | **169 断言全通过**（新增 S11 按键闭环 26 条：上报 201/幂等 200、换 `boot_id` 后 seq=0 再来一条、respond 去重、`bad_decision`、claim 文本协议、done 回执回显、重发、cancel、`queue_dropped` 透传） |
+| `tools/ui_check.mjs` | 第1、2周检查无回归；`notify` 的 decision 枚举框 = `ack/cancel`；按键面板渲染出真实事件行；连点 3 次「回应」→ **1 次 POST** 且 `client_token` 唯一 |
+| `pio run` | 编译通过，RAM 17.7% / Flash 27.7% |
+| 真机端到端 | **部分**（2026-09-21）：按键/指令闭环在早期真机跑通（见事件表）；`PIN_LED=3` 依据官方 BSP 清单核实，物理单闪待肉眼确认 |
+
+---
+
+## 阶段 15 · 第3周收尾：两个真空缺口（状态防伪没有自动化、文档里的环境变量名是错的）
+
+把第3周交付后，拿真实服务器跑了一遍（而不是只看文档里写的“已通过”），暴露两件事。
+
+### 坑 1：文档里的 `$env:DB_PATH` 根本不是程序读的变量名
+
+`docs/week3-button.md` 的“怎么跑”一节写的是
+`$env:DB_PATH=".scratch\sim3.db"`，但服务端读的是 `TELEMETRY_DB`
+（`app.py:24`）。后果不是报错，而是**静默写进了真实库**
+`server/data/telemetry.db`——比报错坏得多，因为你以为自己在用隔离库。
+第2周的文档写对了（`TELEMETRY_DB`），只有第3周这页漏了。已修正。
+
+> 教训：“怎么跑”里的每一行都得真的执行一遍。
+> 本轮刚开始就踩了这个坑：`/health` 返回的 `db` 字段直接显示
+> 它连的是哪个库，一眼就看出来了。这个字段就是为这种事存在的。
+
+### 坑 2：“状态防伪”一直是只有设计、没有断言
+
+第3周的文档写了“事件状态只能由服务端写”，但真去看测试：
+`test_buttons.py` 里没有一条断言去捡“上报载荷里塞 `state=acked` 会怎么样”。
+这是典型的“设计对了、但没人守着”——下一个改 `record_press` 的人只要顺手
+`**payload` 展开一下，就能把这条边界无声拆掉。已补 2 个单测 + S12 的 19 条端到端断言。
+
+断言里最有价值的不是“伪造被拒绝”，而是几个**跨层不变量**：
+
+- 假锳的 `state` 被忽略后，事件仍是 `received`；
+- 未领取的指令直接回执 `done` → `not_claimed 409`（设备不能自封完成）；
+- 已终态指令再回执 → `already_terminal 409`（已显示的“成功”不能被改写）。
+
+后两条本来就有实现（第2周就写了），但没人从“防伪”这个角度去把它们串起来。
+它们是同一条原则的三个侧面：**设备只能提供事实的原料，不能提供对事实的结论。**
+
+### 坑 3：没设令牌的实例会把“401 断言”变成假通过
+
+S12 里“无令牌回应必须 401”这条，在一个没设 `CONTROL_TOKEN` 的实例上跑会失败。
+本轮就是先在无令牌实例上跑出 4 条 FAIL，一度以为是代码 bug。
+现在改成显式前置条件：没设令牌就打 `SKIP`，而不是假通过。
+
+> 一个测试在不同环境下给出不同结论，本身就是缺陷。
+> 要么把前置条件写死，要么把它变成显式的 `SKIP`。
+
+### 验证
+
+| 项 | 结果 |
+| --- | --- |
+| `pytest -q`（全量） | **130 passed**（新增 2 个状态防伪单测） |
+| `tools/command_sim.py --fast` | **188 断言全通过**（新增 S12 状态防伪 19 条） |
+| `ui_check.mjs` | 按键面板与回应防抖断言全过（回应连点 3 次 → 1 次 POST） |
+| 真实库未被污染 | 误启动那一次后，`button_events` 仍为 0 行 |
+
+---
+
+## 阶段 16 · 让“插上板子、打开网页就有数据”成立（服务端守护 + 自动弹看板）
+
+### 触发的问题
+
+用户反馈：插上开发板后双击 `server/static/index.html`（`file://` 打开），页面报
+**“无法连接服务端”**。期望是“插上板子、打开网页就自动有数据采集”。
+
+### 根因（先证伪“是代码/防火墙的锅”）
+
+- 实测 `Invoke-WebRequest http://127.0.0.1:8000/health` → **连接被积极拒绝**；
+  `Get-NetTCPConnection -LocalPort 8000` → **0 个监听**。即 **uvicorn 根本没在跑**。
+- `index.html` 用 `file://` 打开时，JS 会去连 `http://127.0.0.1:8000`（第 260 行那段
+  `API` 解析）。连不上就进 catch，`setAlarm('crit','无法连接服务端',…)`。
+- **关键认知**：浏览器里的 JS 出于安全沙箱**无法启动本地进程**。所以“打开网页自动
+  起服务端”在前端**做不到**——“自动”只能由一个**本地常驻守护**来兜。这排除了
+  “改改 index.html 就能自启”的幻想。
+- 防火墙不是这次的因（这次服务端进程压根不存在，谈不上入站被拦）。但板子要从
+  手机热点把数据传进来，服务端必须绑 `0.0.0.0` 而非 `127.0.0.1`——`doctor.py` 的
+  “服务端在监听 8000”一项会盯这条。
+
+### 方案：`server/tools/auto_serve.py`（守护 + 看板自动弹出）
+
+一个脚本三种用法，单一事实来源，不碰防火墙/不烧固件/不静默改系统：
+
+1. **保证服务端在 `0.0.0.0:8000`**：`/health` 通则接管（不重复起）；不通且端口空
+   → `uvicorn` 子进程拉起；子进程死了 → 自动重启。`--once` 只确保起来并开看板后退出。
+2. **盯着开发板**：`pyserial` 扫 `comports()`，命中 `VID==0x303A && PID==0x1001`
+   即“板子插着”。由“未插→插上”跃迁时 `webbrowser.open('http://localhost:8000/')`。
+3. **`--install-startup`**：往当前用户启动项写一个 `.vbs`（`pythonw.exe … --watch
+   --no-browser-on-start`，窗口样式 0 隐藏），开机即后台常驻。`--uninstall-startup`
+   删除，`--stop` 读 `auto_serve.pid` 后 `taskkill /T /F` 连带子进程一起收。
+
+配套：
+- 仓库根新增 **`插上板子自动采集.bat`**（双击 = `auto_serve.py --watch`，窗口开着=守护在跑）。
+- **`start_server.bat` 改成幂等**：起 uvicorn 前先探 `/health`，已在跑就直接开浏览器
+  `exit /b 0`，避免“端口被占用→uvicorn 直接退出”的假失败；并在阻塞前 `start ""` 先开浏览器。
+- **`index.html` 的“无法连接服务端”改成可照做的指引**：区分 `file://` 与同源两种场景，
+  直接告诉用户“双击『插上板子自动采集.bat』”，而不是只甩一句网络错误。失败仍可见，但可行动。
+
+### 验证（全部实测，非照抄设计）
+
+| 验证项 | 命令/方法 | 结果 |
+| --- | --- | --- |
+| `--once` 拉起 + 健康 | `auto_serve.py --once --no-browser` | 日志“服务端就绪”，`/health`→`{"ok":true,…}` |
+| 幂等接管 | 再跑一次 `--once` | “服务端已在运行（端口 8000）”，不重复起 |
+| 板子检测 | `auto_serve.board_present()` | **True**（COM5 = `USB\VID_303A&PID_1001`） |
+| 服务端托管页面 | `GET http://localhost:8000/` | 200，31KB，含标题（同源，无 `file://` 跨源问题） |
+| doctor 监听项 | `doctor.py --port 8000` | `[ ok ] 服务端在监听 8000  0.0.0.0:8000（局域网可达）` |
+| **崩溃自愈** | `--watch` 中 `Stop-Process` 杀 uvicorn 子进程 | 日志“服务端进程退出（code=4294967295），准备重启…”→“启动服务端”；监听 PID **4852→33080**；`/health` 复 200 |
+| **真机全链路在线** | 守护拉起后看 `uvicorn.log` / `/api/v1/status` | 板子 `94:A9:90:1C:6F:D4`@`172.20.10.14` 持续 `POST /ingest 201`、`commands/claim 200`；`readings_last_60s=573`、`last_batch.age_ms≈2s`、`ntp_fresh` |
+| 前端渲染（真数据） | `node tools/ui_check.mjs --origin http://127.0.0.1:8000` | 报警 `a-ok`“链路正常”，设备“在线”，累计样本 23 万+，分段/缺口/可信度判定全过 |
+| 后端回归 | `pytest -q` | **130 passed** |
+
+一句话结论：**服务端常驻后，“插上板子→数据自动入库→打开网页就有数据”闭环成立**，
+且服务端崩溃能在 ~3s 内自愈，板子断流期间的样本由板上环形缓冲补传（第1周机制）。
+
+### 被证伪的假设 / 踩的坑（记下来别再踩）
+
+- **“`Start-Process` 返回了就是起来了”——错。** 第一次用嵌套
+  `powershell -NoProfile -File test.ps1` + `Start-Process … -RedirectStandardOutput`
+  测守护，`$sup.Id` 为空、`auto_serve.log` 无“守护开始”、`Get-Process python` 一个都没有：
+  进程**根本没被拉起**，而脚本还“正常跑完”打印了一堆空值，差点误判成“守护有 bug”。
+  **教训**：验证“进程起来了”不能信 `Start-Process` 的返回，要看**三个独立证据**——
+  守护自己的日志行（“守护开始”）、`auto_serve.pid`、`Get-Process`/端口监听。改成在
+  **前台 shell 会话**直接跑 `auto_serve.py --watch`（能看到实时日志）后，一次就过。
+- **健康检查别包在 PowerShell 函数里图省事。** `function H { try{(iwr …).StatusCode}catch{'DOWN'} }`
+  在脚本里反复返回**空**（既非 200 也非 DOWN），而**内联**同一句 `Invoke-WebRequest` 一直正常。
+  函数封装 + 管道输出捕获把结果吞了。**教训**：判定“服务端活没活”用内联、看 `.Content`，
+  别依赖被封装后的返回値；真正的取证以**服务端日志 + 端口 PID** 为准。
+- **开机自启不该在登录时弹浏览器。** 启动项里特意用 `--no-browser-on-start`：否则每次
+  开机都弹一个看板页，很烦。只在“板子由未插变为插上”那一刻弹，符合“插上板子才看”的直觉。
+
+### 已知边界
+
+- 守护靠 `pyserial` 认板子；**没装 pyserial 时 `board_present()` 恒 False**，即“插板自动
+  弹看板”失效，但“服务端常驻 + 崩溃自愈”不受影响（那才是数据不断的根本）。`requirements.txt`
+  未强依赖 pyserial，弹看板属锦上添花。
+- `--install-startup` 写的是**当前用户**启动项（`%APPDATA%\…\Startup`），换用户/换机要重装。
+- 守护与 `start_server.bat` 同时跑会争 8000：后起的那个 `/health` 通就接管、不会重复绑，
+  但别故意同时开两个 `--watch`（崩溃时可能双双去抢着重启）。日常二选一即可。
+
 ## 横向：三条一直用到的判断准则
 
 ### 1. 同一个事实不要存两处
@@ -553,5 +777,19 @@ done 回执 422 失败 → 2 秒后幂等重领到同一条 → 从头再跑一�
   progress 就能无限续命。目前靠固件不再重跑来规避，服务端侧没有兜底。
 - **固件侧零单测**：`split_claim` 与手拼 JSON 这两个 bug 都出在纯函数上，
   本来最容易在 PC 上测（host-based unit test），却只能靠真机暴露。
-- **加速度计三轴偏置未校准**：静止时 |a|≈1.67 而非 1.0，`selftest` 恒判
-  `accel_out_of_range`。第1周遗留，需要在 `sensors.cpp` 加零偏标定。
+- **加速度计**：三轴恒零的根因是 QMA6100P 上电默认 suspend，已修（唤醒 bit7 需写 `0xC0` 再写 `0x80`
+  才被接受）；静态 |a|≈1.03，量纲正确。三轴偏置仍未做零偏标定，`selftest` 的
+  `accel_out_of_range` 阈值偏紧，第1周遗留。
+- **`PIN_LED` 已上板核实为 `GPIO3`（高电平点亮）**，`PIN_LED_VERIFIED=1`，阶段 14 的
+  `pin_unverified` 隐患已关闭。
+- **物理反馈只有 LED**。佩戴场景更该用振动马达或蜂鸣器；`button_play_decision()`
+  已经是"按 decision 播一段物理图案"的抽象，换执行器只改这一个函数 + `config.h`。
+- **按键只有一种语义**（按一下 = 一次待回应事件），没有长按/双击/组合键。
+  做手势要先决定判在板上还是服务端：判在板上会给幂等键加一个新维度，
+  判在服务端会让本地反馈变慢——而"立刻有反应"正是这一周最硬的那条要求。
+- **`notify` 的 ttl 只有 30 秒**，设备离线超过 30 秒的回应必然 `expired`。
+  这是刻意的：宁可失败可见，也不要 5 分钟后突然闪灯。
+- **按键上报的重试预算是 10 次 / 队列 8 条**，超出记入 `queue_dropped`
+  并随下一次成功上传报出——痕迹不丢，但事件本身确实丢了。
+- **事件与指令只关联最近一次**（`request_id`）。要审计"这次按键历史上被回应过几次、
+  每次结果如何"，得去 `commands` 表按 `params_json` 里的 `event_id` 反查，够用但不优雅。

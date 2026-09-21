@@ -176,10 +176,43 @@
   </section>
 
   <section>
+    <h3>按键事件（第3周）</h3>
+    <div class="prov">
+      <div class="cmdrow">
+        <span class="note" id="btn_stats"></span>
+        <button class="btn" id="btn_refresh">立即刷新</button>
+      </div>
+      <div class="note" id="btn_note"></div>
+    </div>
+    <div class="tablewrap" style="margin-top:10px">
+      <table>
+        <thead><tr>
+          <th class="l">服务端收到</th><th class="l">事件</th><th class="l">设备</th>
+          <th class="l">板端按下时刻</th><th class="l">事件状态</th>
+          <th class="l">notify 指令</th><th class="l">操作</th>
+        </tr></thead>
+        <tbody id="btn_tbody"></tbody>
+      </table>
+    </div>
+    <div class="note">
+      佩戴者按下板上按键时，LED 立刻单闪——本地反馈不等网络。事件上报到这里后，
+      点「回应 / 取消」会通过第2周的指令通道下发一条 notify，设备领取后播放
+      对应图案（ack=两下慢闪，cancel=六下快闪）。「notify 指令」一列就是那条指令
+      的实时状态：expired = 设备没来领（离线），timeout = 领了没结果，
+      done = 设备已播放反馈。失败不静默：终态非 done 时给出「重发」。
+    </div>
+  </section>
+
+  <section>
     <h3>加速度合矢量 |a|（g）</h3>
     <div class="chartbox">
       <canvas id="c_acc"></canvas>
       <div class="tip" id="tip_acc"></div>
+    </div>
+    <div class="note">
+      静止时 |a| 应在 1 g 附近小幅抖动。若整条线贴着 0 不动，那是传感器没在出数，
+      不是"自由落体"——上方报警会直接点出来。设备端读不到数时写 NaN（入库为 null），
+      图上是断点而不是 0，避免"没有数据"被伪装成"数值就是 0"。
     </div>
   </section>
 
@@ -711,6 +744,14 @@ async function tick() {
     const nonFresh = Object.entries(counts).filter(([t]) => t !== 'ntp_fresh');
     const nonFreshN = nonFresh.reduce((n, [, c]) => n + c, 0);
 
+    // 加速度计"恒零"检测：QMA6100P 上电默认 suspend，此时数据寄存器稳定返回
+    // 0x0000——I2C 通、读也不报错，三轴全 0 会被画成一条贴着 0 的平线，
+    // 看上去像"这个指标没反应"。真实的加速度计静止时至少有一轴接近 ±1g，
+    // 且必然带噪声，全窗口严格等于 0 只能是传感器没在出数（null=false 排除读失败）。
+    const magPts = series.pts.filter(p => p.mag !== null && p.mag !== undefined);
+    const magZeroN = magPts.filter(p => p.mag === 0).length;
+    const accelDead = magPts.length >= 20 && magZeroN === magPts.length;
+
     const stopped = !cd.collect;
     // 停止后设备应该很快安静下来。若停止指令下发很久之后还在收到新批次，
     // 说明板子没轮询到指令（或固件没更新）——这不能一路滑进"已停止采集"那个
@@ -747,10 +788,21 @@ async function tick() {
     } else if (recentDrop > 0) {
       setAlarm('warn', '板上丢弃 ' + recentDrop + ' 个样本',
         '上传持续失败导致环形缓冲溢出，设备已如实记账。');
+    } else if (accelDead) {
+      setAlarm('warn', '加速度计无输出 · 窗口内 ' + magZeroN + ' 个样本三轴全为 0',
+        '这不是"静止"，而是传感器没在出数：QMA6100P 上电默认处于 suspend，'
+        + '若固件没写唤醒寄存器，数据寄存器会稳定返回 0x0000。'
+        + '设备端已按此修复（写 PWR_MGMT_1 bit7 唤醒）；'
+        + '若仍为全 0，请看串口是否打印"[sensors] 警告：加速度计连续 N 次读到全零"。');
     } else if (nonFreshN > 0) {
+      const unsyncedN = counts['unsynced'] || 0;
       setAlarm('warn', '时间戳可信度不足 · ' + nonFreshN + ' / ' + rows.length + ' 个样本不可参考',
         nonFresh.map(([t, c]) => TRUST_TEXT[t] + ' ' + c).join('，')
-        + '　服务端接收时间仍然权威，数据本身没有丢失。');
+        + (unsyncedN > 0
+            ? '　设备刚上电、NTP 还没同步时必然如此，属过渡态：'
+              + '同步成功后新样本会逐批把窗口里的旧样本顶出去，'
+              + '通常几十秒内自动转为「链路正常」。'
+            : '　服务端接收时间仍然权威，数据本身没有丢失。'));
     } else if (st.total_dropped > 0) {
       setAlarm('warn', '历史累计丢弃 ' + st.total_dropped + ' 个样本', '当前窗口内无新增丢失。');
     } else {
@@ -760,8 +812,12 @@ async function tick() {
     $('refreshed').textContent = '最近刷新 ' + new Date().toLocaleTimeString('zh-CN', { hour12:false })
       + '　服务端时间 ' + fmtTime(st.server_time_ms);
   } catch (e) {
-    // 服务端本身不可达也必须看得见，不能停在旧数据上假装一切正常
-    setAlarm('crit', '无法连接服务端', String(e.message || e));
+    // 服务端不可达必须看得见，且要给出能照做的修复指引，而不是只甩一句网络错误。
+    const viaFile = location.protocol === 'file:';
+    const hint = viaFile
+      ? '服务端没在跑。请双击仓库根目录的「插上板子自动采集.bat」（或 start_server.bat），窗口开着别关，再刷新本页。'
+      : '服务端没在跑或刚重启。请在服务器上运行 start_server.bat / auto_serve.py，稍候刷新。';
+    setAlarm('crit', '无法连接服务端 · ' + (API || '同源'), hint + '　（' + String(e.message || e) + '）');
   } finally {
     inflight = false;
   }
@@ -790,5 +846,6 @@ window.DASH = {
 };
 </script>
 <script src="commands.js"></script>
+<script src="button.js"></script>
 </body>
 </html>

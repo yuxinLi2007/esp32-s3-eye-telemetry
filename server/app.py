@@ -17,6 +17,7 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+import buttons
 import commands
 import db
 
@@ -39,6 +40,7 @@ CONTROL_TOKEN = os.environ.get("CONTROL_TOKEN")
 async def lifespan(_app):
     conn = db.init_db(DB_PATH)
     commands.init_schema(conn)
+    buttons.init_schema(conn)   # 第3周：按键事件表（幂等建表，旧库不受影响）
     conn.close()
     if not INGEST_TOKEN:
         print(
@@ -427,6 +429,108 @@ def command_result(request_id: str, payload: CommandResultIn, conn=Depends(get_c
         "command": commands.to_dict(row, commands.now_ms(),
                                     commands.events_of(conn, request_id)),
     }
+
+
+# ============================================================ 第3周：按键闭环
+#
+# 场景：佩戴者按下板上按键 -> 板端立刻给本地物理反馈（不等网络）-> 事件上报
+# 到这里 -> Web 实时看到 -> Web 点"回应/取消" -> 走第2周的指令通道下发 notify
+# -> 设备领取并播放对应反馈。
+#
+# 鉴权口径与前两周一致：
+#   板端上报按键 -> INGEST_TOKEN（和 ingest/claim/result 同一把，板子上只配一把）
+#   Web 回应/取消 -> CONTROL_TOKEN（"能改设备行为"的操作，和下发指令同级）
+#   读事件列表     -> 不设鉴权，口径同 /api/v1/readings（只读、不含密钥）
+
+
+class ButtonPress(BaseModel):
+    device_mac: str
+    boot_id: str
+    # press_seq 在"本次启动"内自增；幂等键 (mac, boot_id, press_seq) 保证
+    # 板端重试不会把一次按键变成两次。
+    press_seq: int = Field(ge=0)
+    fw_version: str | None = Field(default=None, max_length=32)
+    t_press_uptime_ms: int | None = Field(default=None, ge=0)
+    t_device_ntp_ms: int | None = None
+    ntp_synced: bool = False
+    ntp_sync_age_s: int | None = Field(default=None, ge=0)
+    queue_dropped: int = Field(default=0, ge=0)
+
+
+@app.post("/api/v1/button", dependencies=[Depends(require_ingest_token)])
+def button_press(payload: ButtonPress, conn=Depends(get_conn)):
+    """板端上报一次按键。新事件 201；幂等命中（重试重发）200 + X-Deduped:1。
+
+    状态码本身就说明"这次上传是不是第一次"，板端与排查的人都不必比对时间戳。
+    """
+    row, deduped = buttons.record_press(
+        conn,
+        device_mac=payload.device_mac,
+        boot_id=payload.boot_id,
+        press_seq=payload.press_seq,
+        fw_version=payload.fw_version,
+        t_press_uptime_ms=payload.t_press_uptime_ms,
+        t_device_ntp_ms=payload.t_device_ntp_ms,
+        ntp_synced=payload.ntp_synced,
+        ntp_sync_age_s=payload.ntp_sync_age_s,
+        queue_dropped=payload.queue_dropped,
+    )
+    body = buttons.to_dict(row, buttons.now_ms(),
+                           buttons.command_of(conn, row["request_id"]))
+    return JSONResponse(
+        status_code=200 if deduped else 201,
+        content={"ok": True, "deduped": deduped, "event": body},
+        headers={"X-Deduped": "1" if deduped else "0"},
+    )
+
+
+@app.get("/api/v1/button/events")
+def button_events(
+    limit: int = Query(default=30, ge=1, le=200),
+    device_mac: str | None = None,
+    state: str | None = Query(default=None, description="逗号分隔：received,acked,cancelled"),
+    conn=Depends(get_conn),
+):
+    """Web 端轮询用。顺带惰性结算指令超时（和 /api/v1/status 同一个机制），
+    于是"notify 指令是否还活着"在这里看到的与指令面板永远一致。"""
+    return {
+        "ok": True,
+        "server_time_ms": int(time.time() * 1000),
+        "stats": buttons.stats(conn),
+        "events": buttons.list_events(conn, limit=limit, device_mac=device_mac,
+                                      state=state),
+    }
+
+
+class ButtonRespond(BaseModel):
+    decision: str = Field(description="ack=回应, cancel=取消")
+    client_token: str | None = Field(default=None, max_length=64)
+
+
+@app.post("/api/v1/button/events/{event_id}/respond",
+          dependencies=[Depends(require_control_token)])
+def button_respond(event_id: int, payload: ButtonRespond, request: Request,
+                   conn=Depends(get_conn)):
+    """Web 对一次按键作出回应/取消。
+
+    内部通过 buttons.respond() -> commands.create(op="notify") 生成指令，
+    复用第2周整套领取/状态机/超时/审计；返回体里带上这条指令，
+    前端可以直接把它的 request_id 和状态显示在事件行上。
+    """
+    row, cmd, deduped = buttons.respond(
+        conn, event_id,
+        decision=payload.decision,
+        client_token=payload.client_token,
+        actor=request.client.host if request.client else "web",
+    )
+    body = buttons.to_dict(row, buttons.now_ms(),
+                           buttons.command_of(conn, cmd["request_id"]))
+    return JSONResponse(
+        status_code=200 if deduped else 201,
+        content={"ok": True, "deduped": deduped, "event": body,
+                 "command": commands.to_dict(cmd, commands.now_ms())},
+        headers={"X-Deduped": "1" if deduped else "0"},
+    )
 
 
 # 界面挂在最后：Starlette 按注册顺序匹配，先注册的 /api 与 /health 不会被它抢走。

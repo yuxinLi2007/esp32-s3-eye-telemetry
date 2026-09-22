@@ -93,7 +93,20 @@
     if (j.error) meta.appendChild(chip('错误码 ' + j.error.code, 'err'));
     if (j.trace) {
       meta.appendChild(chip('引擎 ' + ((j.trace.engine_chain || []).join('→') || j.engine)));
-      if (j.trace.llm_error) meta.appendChild(chip('模型降级：' + j.trace.llm_error, 'err'));
+      // 模型通道状态：只有 degraded 是真故障（画红）；
+      // not_configured / disabled / off 都是"按设计走规则"，中性色，不吓唬人。
+      const lst = j.trace.llm_status;
+      if (lst === 'used') {
+        meta.appendChild(chip('模型 ' + (j.trace.llm_model || '') + ' 已应答', 'read'));
+      } else if (lst === 'not_configured') {
+        meta.appendChild(chip('模型：未配置 key，按默认走规则（非故障）'));
+      } else if (lst === 'disabled') {
+        meta.appendChild(chip('模型通道被配置关闭，走规则'));
+      } else if (lst === 'off') {
+        meta.appendChild(chip('模型通道未调用（指定 rules）'));
+      } else if (lst === 'degraded' || j.trace.llm_error) {
+        meta.appendChild(chip('模型降级：' + j.trace.llm_error, 'err'));
+      }
       meta.appendChild(chip('用时 ' + j.trace.elapsed_ms + ' ms'));
     }
     meta.appendChild(chip('confidence ' + j.confidence));

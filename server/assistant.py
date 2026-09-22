@@ -798,7 +798,7 @@ def _terminal_message(cmd, device_mac):
 
 # ============================================================ 总入口
 def _decide_engine(text, devices, default_mac, engine):
-    """选引擎并做安全对账。返回 (choice, chain, llm_error)。
+    """选引擎并做安全对账。返回 (choice, chain, llm_error, llm_status)。
 
     安全优先的三条对账规则：
       1. 规则引擎判定为 reject（越界/不支持写操作）时，一律以规则为准。
@@ -824,7 +824,8 @@ def _decide_engine(text, devices, default_mac, engine):
             chain.append("llm")
 
     if engine == "rules":
-        return rules, chain, llm_error
+        # 调用方明确要离线：模型通道根本没被调用，谈不上降级。
+        return rules, chain, llm_error, "off"
 
     chosen = None
     if rules["intent"] == REJECT:
@@ -849,7 +850,24 @@ def _decide_engine(text, devices, default_mac, engine):
             "模型倾向于澄清，但规则引擎高置信命中动作，按规则执行（避免过度追问）"]
     else:
         chosen = llm
-    return chosen, chain, llm_error
+
+    # 把"模型通道这次怎么了"写进 trace：只有 degraded 是真故障。
+    # not_configured / disabled 是本项目离线默认形态，off 是调用方指定离线，
+    # used 表示模型真的应答了（其意图是否被采纳另按对账规则）。
+    # 前端只把 degraded 画红——没失败的时候不用"降级"吓唬人。
+    if llm is not None:
+        llm_status = "used"
+    elif llm_error is None:
+        llm_status = "degraded"
+    else:
+        cfg = llm_config()
+        if not cfg["enabled"]:
+            llm_status = "disabled"
+        elif not cfg["api_key"]:
+            llm_status = "not_configured"
+        else:
+            llm_status = "degraded"
+    return chosen, chain, llm_error, llm_status
 
 
 def ask(conn, text, *, device_mac=None, engine="auto", wait_ms=None,
@@ -905,7 +923,7 @@ def _ask_inner(conn, text, *, device_mac, engine, wait_ms, client_token,
                 extra={"trace": _trace(now, started)})
         default_mac = explicit
 
-    chosen, chain, llm_error = _decide_engine(text, devices, default_mac, engine)
+    chosen, chain, llm_error, llm_status = _decide_engine(text, devices, default_mac, engine)
     intent = chosen["intent"]
     conf = chosen.get("confidence", 0.0)
     err = chosen.get("error")
@@ -915,6 +933,9 @@ def _ask_inner(conn, text, *, device_mac, engine, wait_ms, client_token,
     trace["engine_used"] = "llm" if ("llm" in chain and engine != "rules"
                                      and not llm_error) else "rules"
     trace["llm_used"] = trace["engine_used"] == "llm"
+    trace["llm_status"] = llm_status
+    if llm_status == "used":
+        trace["llm_model"] = llm_config()["model"]
     if llm_error:
         trace["llm_error"] = llm_error
         trace["llm_used"] = False

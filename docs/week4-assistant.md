@@ -125,6 +125,22 @@ engine=llm    只试模型；失败仍然降级到规则，不会把功能打挂
 | `ASSISTANT_LLM_ENABLED` | `1` | 设 `0` 彻底关闭模型通道 |
 | `DEVICE_ALLOWLIST` | 空 | 逗号分隔；**设了就是权威白名单** |
 
+### 3.5 模型降级的五种状态：不是每个"走规则"都叫故障
+
+`trace.llm_status` 把"模型通道这次怎么了"写成五值之一，前端各给一个 chip：
+
+| llm_status | 含义 | chip | 算故障吗 |
+|---|---|---|---|
+| `used` | 模型应答了（其意图是否被采纳另按对账规则） | 绿 | 否 |
+| `not_configured` | 没设 `OPENAI_API_KEY`，按默认走规则 | 中性 | **否**（本地默认形态） |
+| `disabled` | `ASSISTANT_LLM_ENABLED=0`，人为关掉 | 中性 | 否 |
+| `off` | 调用方指定 `engine=rules`，模型通道没被调用 | 中性 | 否 |
+| `degraded` | 配了 key 但调用失败（网络/超时/401/垃圾输出） | 红 | **是**，原因在 `trace.llm_error` |
+
+只有 `degraded` 才是真降级：模型本该说话却没说成。没配 key 不是降级——
+那是本项目的离线默认形态，界面上不画红、不吓唬人；而真的调用失败时，
+红色 chip 会把失败原因（异常类型+消息）原样摆出来，符合"失败必须可见"。
+
 ---
 
 ## 4. 白名单：越界的硬边界
@@ -159,7 +175,8 @@ DEVICE_ALLOWLIST 已设置 -> 只认这一份（公网部署口径）
   "action": null,                  // 走了哪个已有接口、参数、指令状态
   "data": null,                    // 查询/采集结果（readings、is_new_sample 等）
   "error": { "code": "need_device", "level": "info", "message": "..." },
-  "trace": { "engine_chain": ["rules"], "engine_used": "rules", "elapsed_ms": 3 }
+  "trace": { "engine_chain": ["rules"], "engine_used": "rules",
+              "llm_status": "not_configured", "elapsed_ms": 3 }
 }
 ```
 

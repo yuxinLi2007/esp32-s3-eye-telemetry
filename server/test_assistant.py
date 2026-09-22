@@ -484,3 +484,54 @@ def test_internal_error_is_caught(client, monkeypatch):
     j = ask(client, "查看上次数据").json()
     assert j["ok"] is False
     assert j["error"]["code"] == "internal_error"
+
+
+def test_llm_status_not_configured(client, monkeypatch):
+    """没配 key：llm_status=not_configured（不是故障），引擎=rules。"""
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    ingest(client)
+    j = ask(client, "查看上次数据", engine="auto").json()
+    assert j["trace"]["engine_used"] == "rules"
+    assert j["trace"]["llm_status"] == "not_configured"
+    assert "OPENAI_API_KEY" in (j["trace"].get("llm_error") or "")
+
+
+def test_llm_status_off_when_rules(client):
+    """engine=rules：模型通道根本没被调用，llm_status=off 且无 llm_error。"""
+    ingest(client)
+    j = ask(client, "查看上次数据", engine="rules").json()
+    assert j["trace"]["llm_status"] == "off"
+    assert not j["trace"].get("llm_error")
+
+
+def test_llm_status_degraded_when_key_but_call_fails(client, monkeypatch):
+    """配了 key 但调用失败：这才是真降级，llm_status=degraded 且带原因。"""
+    ingest(client)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-not-real")
+
+    def boom(*a, **k):
+        raise RuntimeError("连接被重置")
+
+    monkeypatch.setattr(assistant, "parse_llm", boom)
+    j = ask(client, "查看上次数据", engine="auto").json()
+    assert j["ok"] is True                      # 降级不等于失败
+    assert j["trace"]["engine_used"] == "rules"
+    assert j["trace"]["llm_status"] == "degraded"
+    assert "连接被重置" in j["trace"]["llm_error"]
+
+
+def test_llm_status_used_when_model_ok(client, monkeypatch):
+    """模型正常应答：llm_status=used 且记下模型名。"""
+    ingest(client)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-not-real")
+    monkeypatch.setenv("OPENAI_MODEL", "fake-model-1")
+
+    def good(text, *, devices, default_mac):
+        return ({"intent": assistant.QUERY_HISTORY, "device_mac": MAC, "slots": {},
+                 "confidence": 0.9, "error": None, "notes": [], "llm_reason": "ok"}, None)
+
+    monkeypatch.setattr(assistant, "parse_llm", good)
+    j = ask(client, "查看上次数据", engine="auto").json()
+    assert j["trace"]["llm_status"] == "used"
+    assert j["trace"]["llm_model"] == "fake-model-1"
+    assert j["trace"]["engine_used"] == "llm"

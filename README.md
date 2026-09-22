@@ -450,6 +450,9 @@ HTTP 重发不会把"用户按了一次"变成"按了两次"。断网期间按�
 **模型只翻译、不执行。** 它唯一的产出是 `intent + slots`，设备必须通过白名单校验，
 动作由服务端调用已有接口完成，回复里的数字也由服务端从库里取出后拼——不让模型复述数字。
 不配 `OPENAI_API_KEY` 时自动走规则引擎，功能不失效；模型报错 / 返回垃圾也一律降级并留痕。
+模型通道状态写在 `trace.llm_status` 并显示成 chip：`used / not_configured / disabled /
+off / degraded` 五值，**只有 `degraded`（配了 key 但调用失败）画红**；没配 key 是离线
+默认形态，不算故障。
 
 含糊（"帮我弄一下"）返回 `clarify`，越界（别人的设备）返回 `reject/forbidden_device`
 且**不下发任何指令**，设备不回返回 `device_no_response`。全部错误都是同一个 JSON 信封，

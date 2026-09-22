@@ -17,6 +17,7 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+import assistant
 import buttons
 import commands
 import db
@@ -531,6 +532,83 @@ def button_respond(event_id: int, payload: ButtonRespond, request: Request,
                  "command": commands.to_dict(cmd, commands.now_ms())},
         headers={"X-Deduped": "1" if deduped else "0"},
     )
+
+
+# ============================================================ 第4周：自然语言助手
+#
+# 一句话 -> 受控意图（query_history / request_capture / clarify / reject）
+# -> 调用已有的 /api/v1/readings 或 /api/v1/commands(op=capture) -> 结构化结果。
+#
+# 鉴权口径：助手会下发写指令，因此比只读接口更接近 /api/v1/commands，
+# 沿用同一把 CONTROL_TOKEN。没有配置 token 的本地开发保持零配置可用。
+# LLM 是否启用只影响"这句话怎么翻译"，不影响"谁能调"。两者不能混为一谈。
+
+
+class AssistantAsk(BaseModel):
+    text: str = Field(min_length=0, max_length=500)
+    device_mac: str | None = Field(default=None, max_length=64)
+    # engine: auto=有 key 用模型、无 key/出错则用规则；rules 强制离线规则；
+    # llm 只试模型（失败仍降级，不会把功能打挂）。
+    engine: str = Field(default="auto")
+    wait_ms: int | None = Field(default=None, ge=0, le=120_000)
+    client_token: str | None = Field(default=None, max_length=64)
+
+
+@app.get("/api/v1/assistant/info")
+def assistant_info(conn=Depends(get_conn)):
+    """助手能力自述：前端用它渲染示例问题，也让人一眼看到当前用哪个引擎、
+    白名单里有哪些设备。模型是否启用是"配置事实"，不是秘密。"""
+    cfg = assistant.llm_config()
+    return {
+        "ok": True,
+        "version": assistant.VERSION,
+        "actions": [
+            {"intent": assistant.QUERY_HISTORY, "label": "查看历史数据",
+             "write": False, "endpoint": "/api/v1/readings"},
+            {"intent": assistant.REQUEST_CAPTURE, "label": "请求一次新采集",
+             "write": True, "endpoint": "/api/v1/commands", "op": "capture"},
+        ],
+        "llm": {
+            "enabled": assistant.llm_available(),
+            "configured": bool(cfg["api_key"]),
+            "disabled_by_env": not cfg["enabled"],
+            "model": cfg["model"],
+            "base_url": cfg["base_url"],
+            "note": "未配置 OPENAI_API_KEY 时自动使用规则引擎，功能不失效",
+        },
+        "error_codes": [
+            {"code": code, "level": level, "message": msg}
+            for code, (level, msg) in assistant.ERROR_CATALOG.items()
+        ],
+        "allowed_devices": assistant.allowed_devices(conn),
+        "allowlist_source": ("DEVICE_ALLOWLIST"
+                             if (os.environ.get("DEVICE_ALLOWLIST") or "").strip()
+                             else "batches(服务端见过的设备)"),
+    }
+
+
+@app.post("/api/v1/assistant/ask",
+          dependencies=[Depends(require_control_token)])
+def assistant_ask(payload: AssistantAsk, request: Request, conn=Depends(get_conn)):
+    """自然语言入口。**永远返回 200 + 统一信封**：
+    越界、含糊、无数据、设备不回都是结构化的 ok=false，而不是 HTTP 错误。
+
+    这里刻意不抛 4xx/5xx：助手是"翻译+编排"层，用户说的是一句人话，
+    它不该用协议级错误回应。前端只需判断 body.ok 和 body.error.code，
+    错误分类全部走稳定错误码，不解析中文。
+    """
+    engine = (payload.engine or "auto").strip().lower()
+    if engine not in ("auto", "rules", "llm"):
+        engine = "auto"
+    result = assistant.ask(
+        conn, payload.text, device_mac=payload.device_mac, engine=engine,
+        wait_ms=payload.wait_ms, client_token=payload.client_token,
+        created_by=request.client.host if request.client else None,
+    )
+    result["request"] = {"text": payload.text, "engine": engine,
+                         "device_mac": payload.device_mac,
+                         "wait_ms": payload.wait_ms}
+    return result
 
 
 # 界面挂在最后：Starlette 按注册顺序匹配，先注册的 /api 与 /health 不会被它抢走。

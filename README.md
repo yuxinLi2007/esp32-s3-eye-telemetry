@@ -9,6 +9,10 @@
 第3周起它还是一套**闭环**：佩戴者按下板上按键，板子**立刻**给物理反馈（不等网络），
 事件上到服务端并在网页实时出现，操作者点「回应/取消」，指令回到设备播放对应的 LED 图案。
 
+第4周加了一层**自然语言助手**：用户说人话，大模型只当"意图翻译官"，把句子翻成
+「查看历史数据」或「请求一次新采集」两种受控意图，再由服务端白名单护栏校验后调用
+已有的 VPS 接口。模型不直接执行、不负责复述数字；不配模型 key 时规则引擎照样能用。
+
 ---
 
 ## 三条核心要求
@@ -92,6 +96,7 @@ esp32-s3-eye-telemetry/
 │   ├── development-log.md           开发复盘：分阶段记录坑与验证结果
 │   ├── week2-commands.md            第2周：远程指令通道的设计与验证（状态机/协议/端点）
 │   ├── week3-button.md              第3周：按键闭环的设计与验证（含上板验证清单）
+│   ├── week4-assistant.md           第4周：自然语言助手的设计与验证（含两组必测场景）
 │   ├── board-connect-checklist.md   插上板子网页没数据 → 排查清单（配 tools/doctor.py）
 │   └── 成果总结.md                   阶段性成果与当前状态
 ├── firmware/                        板端（PlatformIO + Arduino）
@@ -114,18 +119,22 @@ esp32-s3-eye-telemetry/
     ├── test_ingest.py               27 项测试（第1周）
     ├── test_commands.py             80 项测试（第2周）
     ├── test_buttons.py              25 项测试（第3周，含状态防伪）
+    ├── assistant.py                 第4周：自然语言意图翻译 + 白名单护栏 + 结构化错误
+    ├── test_assistant.py            26 项测试（第4周）
     ├── requirements.txt
     ├── static/
-    │   ├── index.html               主界面：图表、指标卡、采集开关、指令面板、按键面板骨架
+    │   ├── index.html               主界面：图表、指标卡、采集开关、指令面板、按键面板、助手面板
     │   ├── commands.js              指令面板逻辑（按钮/状态/详情/防抖）
-    │   └── button.js                按键事件面板（2s 轮询、回应/取消、重发入口）
+    │   ├── button.js                按键事件面板（2s 轮询、回应/取消、重发入口）
+    │   └── assistant.js             自然语言助手面板逻辑（示例/结果渲染/写操作标黄）
     ├── tools/
     │   ├── doctor.py                一键体检：插上板子网页没数据时定位卡在哪（只读）
     │   ├── fix_firewall.ps1         修防火墙：禁用全局入站拦截 + 放行端口（自动提权）
     │   ├── fault_inject.py          故障注入：主动制造失败以验证"失败可见"
     │   ├── command_sim.py           假设备模拟器 + 故障注入，打真实 HTTP（188 断言）
     │   ├── auto_serve.py            服务端守护：起/接管/崩溃自愈 + 插板自动弹看板 + 开机自启
-    │   └── ui_check.mjs             DOM 打桩跑界面脚本，断言报警判定与两个面板的防抖
+    │   ├── nl_demo.py               第4周端到端验收：真实 HTTP + 假设备，覆盖两组必测场景
+    │   └── ui_check.mjs             DOM 打桩跑界面脚本，断言报警判定与各面板的防抖
     ├── .env.example                 配置模板 → 复制成 .env
     └── data/telemetry.db            运行期数据库，.gitignore 排除
 ```
@@ -213,12 +222,12 @@ pio device monitor          # 115200
 串口日志会打印 `boot_id`、MAC、WiFi 连接结果、NTP 同步结果，然后是 `===== 开始采集 =====`。
 回到界面应在几秒内看到曲线。
 
-第3周起还会打印按键通道：启动时 `[btn] 按键通道就绪 pin=0(LED=21) 消抖=30ms 队列=8`，
+第3周起还会打印按键通道：启动时 `[btn] 按键通道就绪 pin=0(LED=3) 消抖=30ms 队列=8`，
 按下时 `[btn] 按下 seq=…（LED 已本地反馈）`，上传结果 `[btn] 上传成功 seq=… HTTP 201`
 （重发命中幂等键时是 `HTTP 200`，日志里会写明"早前那次其实已到达"）。
-**LED 没闪先别怀疑代码**：`PIN_LED=21` 与有效电平尚未在硬件上确认，
-照 [`docs/week3-button.md`](docs/week3-button.md) 的「上板验证清单」逐项核对，
-确认后把 `config.h` 里的 `PIN_LED_VERIFIED` 改成 `1`。
+`PIN_LED=3` / `LED_ON_LEVEL=HIGH` 已上板核实（`PIN_LED_VERIFIED=1`）。
+灯没闪先看串口有没有到 `[btn] 按键通道就绪`，再按
+[`docs/week3-button.md`](docs/week3-button.md) 的「上板验证清单」逐项核对。
 
 **排查**：ESP32-S3-EYE 用 GPIO19/20 的原生 USB（枚举为 `303A:1001`），不是 UART 桥。
 `platformio.ini` 里已设置 `ARDUINO_USB_CDC_ON_BOOT=1`，缺了它串口一句日志都看不到。
@@ -418,10 +427,33 @@ HTTP 重发不会把"用户按了一次"变成"按了两次"。断网期间按�
 （8 条，单条重试 10 次），队列满或重试用尽都计入 `queue_dropped`，
 随下一次成功上传报出并显示在界面上——**丢事件可以，丢痕迹不行**。
 
-> ⚠ `PIN_LED=21` / `LED_ON_LEVEL=HIGH` **尚未在硬件上核对**。
-> `config.h` 里 `PIN_LED_VERIFIED=0` 时，notify 回执带 `led_pin_note="pin_unverified"`
-> 并一路显示到网页结果摘要，避免"服务端说成功、灯其实没亮"被静默放过。
-> 上板核对后改成 `1`，`FW_VERSION` → `0.3.1`。
+> `PIN_LED=3` / `LED_ON_LEVEL=HIGH` 已上板核实，`PIN_LED_VERIFIED=1`，
+> `FW_VERSION=0.3.1`；notify 回执不再带 `led_pin_note="pin_unverified"`。
+
+### 自然语言助手（第4周）
+
+设计与取舍的完整说明见 [`docs/week4-assistant.md`](docs/week4-assistant.md)
+（含错误码表、两组必测场景的判定要点）。
+
+| 方法 | 路径 | 鉴权 | 作用 |
+|---|---|---|---|
+| GET | `/api/v1/assistant/info` | 无 | 能力自述：两个动作、当前用哪个引擎、错误码表、允许设备 |
+| POST | `/api/v1/assistant/ask` | `X-Control-Token` | 一句话 → 受控意图 → 调已有接口 → 结构化结果 |
+
+一句话只会映射成两个动作，各走一条**已有**接口：
+
+| intent | 用户说法 | 走哪个已有接口 | 时间语义 |
+|---|---|---|---|
+| `query_history` | "查看上次"、"看看最近 50 条" | `GET /api/v1/readings` | **保留旧 `t_server_recv_ms`**，绝不改时间 |
+| `request_capture` | "重新采集"、"现在采一次" | `POST /api/v1/commands` op=capture | **等新样本**，时间戳晚于指令下发时刻 |
+
+**模型只翻译、不执行。** 它唯一的产出是 `intent + slots`，设备必须通过白名单校验，
+动作由服务端调用已有接口完成，回复里的数字也由服务端从库里取出后拼——不让模型复述数字。
+不配 `OPENAI_API_KEY` 时自动走规则引擎，功能不失效；模型报错 / 返回垃圾也一律降级并留痕。
+
+含糊（"帮我弄一下"）返回 `clarify`，越界（别人的设备）返回 `reject/forbidden_device`
+且**不下发任何指令**，设备不回返回 `device_no_response`。全部错误都是同一个 JSON 信封，
+`ask` 永远返回 HTTP 200（鉴权失败除外），不给调用方 500。
 
 ### 数据契约
 
@@ -505,10 +537,15 @@ HTTP 重发不会把"用户按了一次"变成"按了两次"。断网期间按�
 
 ```bash
 cd server
-python -m pytest -q                                 # 130 项（27 + 80 + 25，第1~3周）
+python -m pytest -q                                 # 156 项（27 + 80 + 25 + 26，第1~4周）
 node tools/ui_check.mjs                   # 对着真实服务端跑界面脚本
 node tools/ui_check.mjs --origin http://127.0.0.1:8001
 python tools/command_sim.py --url http://127.0.0.1:8002   # 端到端 188 项断言
+
+# 第4周：自然语言助手端到端（真实 HTTP + 假设备，不碰真实库，17 通过 / 0 失败）
+set TELEMETRY_DB=D:\esp32-s3-eye-telemetry\.scratch\wk4-demo.db
+python -X utf8 -m uvicorn app:app --port 8012
+python -X utf8 tools/nl_demo.py --url http://127.0.0.1:8012   # 另开一个终端
 ```
 
 指令通道是"服务端 / 设备 / 网页"三方异步交互，`TestClient` 那种串行假客户端盖不住时序问题
@@ -559,9 +596,15 @@ python tools/fault_inject.py --url http://127.0.0.1:8001
 - **`CONTROL_TOKEN` 存在 localStorage**，XSS 下会被读走；真要上公网得换短时效会话或服务端代理。
 - **`capture` 单次上限 10 秒**是从 12 秒环形缓冲倒推的。改 `RING_CAPACITY` 或采样率时
   必须同步改 `MAX_CAPTURE_DURATION_MS`，这个耦合目前只有注释和文档，没有测试守着。
-- **`PIN_LED=21` / `LED_ON_LEVEL=HIGH` 未在硬件上确认**（第3周）。
-  `PIN_LED_VERIFIED=0` 期间回执带 `led_pin_note="pin_unverified"`；上板核对见
-  [`docs/week3-button.md`](docs/week3-button.md)。物理反馈目前只有 LED，没有振动/蜂鸣。
+- **物理反馈目前只有 LED**（`GPIO3`，高有效，已核实），没有振动/蜂鸣。
+- **助手的规则词表需要人工维护**：新说法（方言、缩写）可能要补 `CAPTURE_PATTERNS` /
+  `QUERY_PATTERNS`。这是可离线、可确定性测试的代价，换来的是无 key 也能用。
+- **助手只做两个动作**（查历史 / 请求采集）。停止采集、重启、改密码等写操作一律
+  `unsupported_action` 拒绝，这是刻意的：模型不该拿到"能改设备状态"的手。
+- **多设备必须点名**：服务端见过多台且用户没说哪台时返回 `need_device`，绝不默认挑一台。
+- **"重新采集"的默认等待窗口约 71 秒**（ttl+timeout+1s），前端默认只等 12 秒；
+  窗口到了指令还活着时返回 `device_no_response`（不是 timeout），拿 `action.request_id`
+  继续查即可。
 - **按键只有"按一下"一种语义**，没有长按/双击。消抖窗口 30 ms、待传队列 8 条、
   单条重试 10 次（5 秒节流）都是常量，超出预算的按键会丢，但会记进 `queue_dropped`。
 - **`notify` 的 ttl 只有 30 秒**：设备离线超过 30 秒的回应必然 `expired`
@@ -581,7 +624,6 @@ python tools/fault_inject.py --url http://127.0.0.1:8001
 - [ ] 指令状态推送改 WebSocket/SSE，去掉 2 秒轮询
 - [ ] 控制令牌换短时效会话，别放 localStorage
 - [ ] `command_events` 的归档/清理策略（与 `control_log` 同一件事）
-- [ ] **上板核对 LED 引脚与有效电平**，然后把 `PIN_LED_VERIFIED` 改 1、`FW_VERSION` → `0.3.1`
 - [ ] 物理反馈换/加执行器（振动马达或蜂鸣器），只改 `button_play_decision()`
 - [ ] 按键手势（长按/双击）：先决定判在板上还是服务端
 - [ ] `button_events` 的归档/清理策略（同上，第三张会长大的表）

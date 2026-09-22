@@ -526,6 +526,11 @@
     setInterval(() => refresh(false), POLL_MS);
   }
 
+  // 第4周：自然语言助手下发 capture 之后，希望指令面板立刻刷新一次。
+  // 把 refresh 挂到共享 DASH 上，而不是让 assistant.js 去猜这里的状态——
+  // 面板状态仍然只有这一份实现，跨脚本只共享入口。
+  D.refreshCommands = () => refresh(true);
+
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
   else init();
 })();

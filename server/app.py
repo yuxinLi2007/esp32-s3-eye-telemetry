@@ -11,7 +11,8 @@ import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
+from fastapi import (Depends, FastAPI, Form, HTTPException, Query, Request,
+                    Response, UploadFile)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -21,6 +22,7 @@ import assistant
 import buttons
 import commands
 import db
+import voice
 
 DB_PATH = os.environ.get(
     "TELEMETRY_DB", str(Path(__file__).parent / "data" / "telemetry.db")
@@ -42,6 +44,7 @@ async def lifespan(_app):
     conn = db.init_db(DB_PATH)
     commands.init_schema(conn)
     buttons.init_schema(conn)   # 第3周：按键事件表（幂等建表，旧库不受影响）
+    voice.init_schema(conn)     # 第5周：语音事件表（幂等建表，旧库不受影响）
     conn.close()
     if not INGEST_TOKEN:
         print(
@@ -612,4 +615,128 @@ def assistant_ask(payload: AssistantAsk, request: Request, conn=Depends(get_conn
 
 
 # 界面挂在最后：Starlette 按注册顺序匹配，先注册的 /api 与 /health 不会被它抢走。
+# ---------------------------------------------------------------- 第5周：语音链路
+@app.exception_handler(voice.VoiceError)
+async def voice_error_handler(_request, exc: voice.VoiceError):
+    """协议级语音错误（413/415/400/404）统一成 ok=false 信封，前端只认错误码。"""
+    return JSONResponse(
+        status_code=exc.http_status,
+        content={"ok": False,
+                 "error": {"code": exc.code,
+                           "level": getattr(exc, "level", "crit"),
+                           "message": exc.message}},
+    )
+
+
+class VoiceBind(BaseModel):
+    transcript: str | None = Field(default=None, max_length=2000)
+    intent: str | None = Field(default=None, max_length=40)
+    assistant_ok: bool | None = None
+    request_id: str | None = Field(default=None, max_length=64)
+
+
+class VoicePlayed(BaseModel):
+    played: bool
+    tts_engine: str = Field(min_length=1, max_length=40)
+    tts_location: str = Field(min_length=1, max_length=40)
+
+
+@app.get("/api/v1/voice/info")
+def voice_info():
+    """语音能力自述：来源枚举、引擎配置事实、错误码文案，前端不写死中文。"""
+    return voice.info()
+
+
+@app.post("/api/v1/voice/transcribe",
+          dependencies=[Depends(require_control_token)])
+async def voice_transcribe(request: Request, file: UploadFile,
+                           audio_source: str = Form("pc_microphone"),
+                           client_duration_ms: int | None = Form(None),
+                           conn=Depends(get_conn)):
+    """录音 -> 文本中间结果。
+
+    先落 voice_events 一行再识别：识别失败时"有过这次尝试"同样是事实。
+    语义级失败（无声/超时/服务商错误/未配置）返回 200 + ok=false；
+    协议级失败（超大/格式/来源非法）由 voice_error_handler 报 4xx。
+    """
+    data = await file.read()
+    mime = (file.content_type or "").split(";")[0].strip().lower()
+    row = voice.record_start(
+        conn, audio_source=audio_source, audio_mime=mime, audio_bytes=len(data),
+        client_duration_ms=client_duration_ms,
+        client_ip=request.client.host if request.client else None,
+    )
+    try:
+        res = voice.transcribe(data, mime, filename=file.filename or "voice.bin")
+    except voice.VoiceError as exc:
+        voice.attach_result(conn, row["id"], error_code=exc.code,
+                            error_stage="recognition")
+        if exc.http_status != 200:
+            raise
+        return {"ok": False, "event_id": row["id"],
+                "error": {"code": exc.code,
+                          "level": getattr(exc, "level", "warn"),
+                          "message": exc.message}}
+    voice.attach_result(conn, row["id"], transcript=res["text"],
+                        recognition_engine=res["engine"],
+                        recognition_location=res["run_location"],
+                        recognition_latency_ms=res["latency_ms"])
+    return {"ok": True, "event_id": row["id"], "text": res["text"],
+            "engine": res["engine"], "latency_ms": res["latency_ms"],
+            "audio_source": row["audio_source"],
+            "run_location": {"recognition": res["run_location"],
+                             "task": "server"}}
+
+
+@app.post("/api/v1/voice/events/{event_id}/bind",
+          dependencies=[Depends(require_control_token)])
+def voice_bind(event_id: int, payload: VoiceBind, conn=Depends(get_conn)):
+    """把第4周任务结果（意图/ok/指令 id）挂到语音事件行，不在两处各存一份状态。"""
+    row = voice.attach_result(conn, event_id, transcript=payload.transcript,
+                              intent=payload.intent,
+                              assistant_ok=payload.assistant_ok,
+                              request_id=payload.request_id)
+    return {"ok": True, "event": row}
+
+
+@app.post("/api/v1/voice/events/{event_id}/played",
+          dependencies=[Depends(require_control_token)])
+def voice_played(event_id: int, payload: VoicePlayed, conn=Depends(get_conn)):
+    """浏览器回告播放结果：播放发生在哪、用了哪个引擎，都是它自报的事实。"""
+    row = voice.mark_played(conn, event_id, played=payload.played,
+                            tts_engine=payload.tts_engine,
+                            tts_location=payload.tts_location)
+    return {"ok": True, "event": row}
+
+
+@app.get("/api/v1/voice/events")
+def voice_events_list(limit: int = Query(default=30, ge=1, le=200),
+                      audio_source: str | None = None,
+                      conn=Depends(get_conn)):
+    """公开只读，口径同按键事件列表。"""
+    return {"ok": True,
+            "events": voice.list_events(conn, limit=limit,
+                                        audio_source=audio_source)}
+
+
+@app.get("/api/v1/voice/speak",
+         dependencies=[Depends(require_control_token)])
+def voice_speak(text: str = Query(default="", max_length=4000),
+                voice_name: str | None = Query(default=None, max_length=40)):
+    """文本 -> 语音。成功时 body 就是音频；失败只能 503 + JSON 并带兜底提示，
+    因为浏览器合成是"降级"不是"失败"，界面上按 warn 黄显示。"""
+    try:
+        audio, mime, engine = voice.synthesize(text, voice=voice_name)
+    except voice.VoiceError as exc:
+        return JSONResponse(status_code=503, content={
+            "ok": False,
+            "error": {"code": exc.code, "level": getattr(exc, "level", "warn"),
+                      "message": exc.message},
+            "fallback": voice.BROWSER_TTS_ENGINE,
+            "fallback_location": "browser",
+        })
+    return Response(content=audio, media_type=mime,
+                    headers={"X-Voice-Engine": engine})
+
+
 app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="static")

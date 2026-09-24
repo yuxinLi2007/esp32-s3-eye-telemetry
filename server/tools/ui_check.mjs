@@ -258,3 +258,92 @@ if (!acks.length) {
   console.log('回应后按钮态:', stillAck ? 'FAIL 仍在等待且禁用' : '已恢复（下一次点击是新意图）');
   console.log('OK: 回应防抖 + 幂等键生效');
 }
+
+
+// ================= 第5周：语音面板 =================
+// 盯三件肉眼最难回归的事：
+//   1. 没有麦克风能力时，降级路径必须自己说出来（录音键禁用 + 授权录音入口可见），
+//      而不是让用户对着灰按钮猜；
+//   2. 连点「开始录音」只允许起一个 recorder（防抖失效 = 录出两段重叠音频）；
+//   3. 语音链路失败时文字入口必须保持可用——这是课程当堂验证的硬要求。
+const VOICE_JS = new URL('../static/voice.js', import.meta.url);
+const voiceCode = fs.readFileSync(VOICE_JS, 'utf8');
+
+// node 24 有只读 global navigator；没有 mediaDevices 就等于"无麦克风能力"。
+// node 24 自带只读 navigator（无 mediaDevices）= 天然的"无麦克风"环境
+
+const voicePosts = { transcribe: 0, played: 0 };
+const fetchBeforeVoice = globalThis.fetch;
+globalThis.fetch = (u, o) => {
+  const us = String(u);
+  if (o && o.method === 'POST' && us.includes('/api/v1/voice/transcribe')) voicePosts.transcribe++;
+  if (o && o.method === 'POST' && us.includes('/voice/events/') && us.includes('/played')) voicePosts.played++;
+  return fetchBeforeVoice(u, o);
+};
+
+new Function(voiceCode)();
+await new Promise(r => setTimeout(r, 1200));
+
+console.log('\n--- 语音面板（第5周） ---');
+const vInfo = await (await fetch('/api/v1/voice/info')).json();
+const vCodes = new Set((vInfo.error_codes || []).map(e => e.code));
+for (const c of ['no_audio', 'recognition_timeout', 'recognition_failed', 'tts_unavailable'])
+  if (!vCodes.has(c)) fail('语音错误码契约缺 ' + c);
+console.log('错误码契约: 4 个关键码齐全（no_audio/recognition_timeout/recognition_failed/tts_unavailable）');
+console.log('音频来源下拉:', get('vc_source').children.length, '项（应为 4）');
+if (get('vc_source').children.length !== 4) fail('音频来源枚举与服务端不一致');
+console.log('引擎说明:', txt(get('vc_engine_note')).slice(0, 80));
+
+// 无麦克风能力（node 环境即如此）：必须降级可见，且授权录音入口在
+console.log('无麦克风时录音键禁用:', get('vc_record').disabled, '（应为 true）');
+if (get('vc_record').disabled !== true) fail('无麦克风能力时录音键未禁用');
+if (!txt(get('vc_err')).includes('上传授权录音'))
+  fail('降级提示没告诉用户还有"上传授权录音"这条路');
+console.log('降级提示:', txt(get('vc_err')).slice(0, 60));
+
+// 文字入口在任何语音故障下保持可用
+if (get('nl_text').disabled !== false) fail('语音链路影响了文字入口（nl_text 被禁用）');
+console.log('文字入口保持可用: nl_text.disabled =', get('nl_text').disabled);
+
+// --- 录音防抖：装上 MediaRecorder 桩后连点两次「开始录音」 ---
+let gumCalls = 0;
+const recStub = {
+  state: 'inactive',
+  start() { this.state = 'recording'; },
+  stop() {
+    this.state = 'inactive';
+    this.ondataavailable && this.ondataavailable({ data: new Blob([new Uint8Array(700)]) });
+    this.onstop && this.onstop();
+  },
+  stream: { getTracks: () => [{ stop() {} }] },
+};
+globalThis.MediaRecorder = function () { gumCalls++; return recStub; };
+globalThis.MediaRecorder.isTypeSupported = () => true;
+// node 24 的 global navigator 是只读 getter，只能 defineProperty 覆盖
+Object.defineProperty(globalThis, 'navigator', {
+  value: { mediaDevices: { getUserMedia: async () => ({}) } },
+  configurable: true,
+});
+
+get('vc_record').onclick();
+get('vc_record').onclick();   // 连点：只允许起一个 recorder
+await new Promise(r => setTimeout(r, 300));
+console.log('连点 2 次「开始录音」→ getUserMedia 调用:', gumCalls, '（应为 1）');
+if (gumCalls !== 1) fail('录音防抖失效：getUserMedia 被调了 ' + gumCalls + ' 次');
+
+// 结束录音 → 走真服务端：本环境无 OPENAI_API_KEY，应如实报 voice_not_configured
+// 桩里的 <select> 不会跟随 option 变化，value 还停在通用默认 '3000'；
+// 真实浏览器里 voice.js 填完选项后 value 就是第一项，这里显式对齐。
+get('vc_source').value = 'pc_microphone';
+get('vc_record').onclick();
+await new Promise(r => setTimeout(r, 1500));
+console.log('识别请求 POST 次数:', voicePosts.transcribe, '（应为 1）');
+if (voicePosts.transcribe !== 1) fail('识别请求发了 ' + voicePosts.transcribe + ' 次');
+const vErr = txt(get('vc_err'));
+console.log('无 key 时界面反馈:', vErr.slice(0, 70));
+if (!vErr.includes('voice_not_configured'))
+  fail('未配置语音服务时界面没有如实报错（收到: ' + vErr + '）');
+if (!txt(get('vc_timeline')).includes('识别')) fail('状态时间轴缺"识别"态');
+console.log('状态时间轴:', txt(get('vc_timeline')));
+if (get('nl_text').disabled !== false) fail('语音失败后文字入口被禁用');
+console.log('OK: 语音面板降级、防抖与文字入口隔离均生效');

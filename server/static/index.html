@@ -185,6 +185,40 @@
   </section>
 
   <section>
+    <h3>语音链路（第5周）</h3>
+    <div class="prov">
+      <div class="nl-row">
+        <button class="btn op" id="vc_record" type="button">开始录音</button>
+        <label>音频来源</label>
+        <select id="vc_source"></select>
+        <span class="badge b-done" id="vc_state">待命</span>
+      </div>
+      <div class="nl-row" style="margin-top:8px">
+        <label>上传授权录音</label>
+        <input type="file" id="vc_upload" accept="audio/*">
+        <button class="btn" id="vc_compare" type="button">同句走文字入口（对照）</button>
+      </div>
+      <div class="note" id="vc_engine_note"></div>
+      <div id="vc_err"></div>
+      <div id="vc_timeline" style="margin-top:6px"></div>
+      <div class="note" id="vc_transcript"></div>
+      <div class="note" id="vc_answer"></div>
+      <div id="vc_compare_out"></div>
+      <div class="tablewrap" style="margin-top:8px">
+        <table>
+          <thead><tr>
+            <th class="l">id</th><th>服务端时间</th><th class="l">音频来源</th>
+            <th class="l">识别引擎/位置</th><th class="l">识别原文</th>
+            <th class="l">意图</th><th class="l">播放</th><th class="l">错误</th>
+            <th class="l">合成引擎/位置</th>
+          </tr></thead>
+          <tbody id="vc_tbody"></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <section>
     <h3>远程采集指令（第2周）</h3>
     <div class="prov">
       <div class="cmdrow">
@@ -895,5 +929,6 @@ window.DASH = {
 <script src="commands.js"></script>
 <script src="button.js"></script>
 <script src="assistant.js"></script>
+<script src="voice.js"></script>
 </body>
 </html>

@@ -745,6 +745,71 @@ S12 里“无令牌回应必须 401”这条，在一个没设 `CONTROL_TOKEN` �
 
 ---
 
+## 阶段 18 · 第5周：语音链路——从"说一句话"到"听到回答"每一步可见
+
+设计文档见 `week5-voice.md`。这里只记坑。
+
+### 设计选择：识别文本只是"一句用户文本"
+
+语音链路不新开任何执行通道：识别结果原样交给第4周 `/assistant/ask`，
+同一端点、同一信封、同一份白名单护栏。「对照」按钮把同一句话再走一次文字入口，
+两行并排——相同才叫复用，不同就是 bug。来源与位置（`audio_source` /
+`recognition_location` / `tts_location`）是落库的事实，不是界面形容词；
+收到录音先落 `voice_events` 行再做网络调用，识别失败时"有过这次尝试"同样留痕。
+失败口径沿用第4周：协议违规用状态码（401/400/404/413/415），语义失败用
+200 + ok=false；唯一例外是 `/voice/speak`——成功时 body 必须是音频，
+失败只能 503 + JSON，并带 `fallback: browser_speechsynthesis` 让浏览器兜底。
+
+### 坑 1：StaticFiles mount 会吞掉后注册的路由
+
+`app.mount("/", StaticFiles(...))` 按注册顺序匹配。语音路由块起初写在 mount 之后，
+六个端点**全部 404**，FastAPI 不报任何警告——路径被静态目录"接住"了，
+返回的是 index.html（对 GET）或 405/404（对 POST）。把整个语音路由块挪到
+mount 之前并在两处写死注释。教训：单文件 app 里"注册顺序"就是路由优先级，
+新增路由块必须插在 mount 前，这不是风格问题。
+
+### 坑 2：缺 python-multipart，Form/UploadFile 直接起不来
+
+FastAPI 对 multipart 表单是硬依赖 `python-multipart`：缺了它，
+**启动时**就在路由声明处抛断言错误（不是运行时才失败）。
+`requirements.txt` 补 `python-multipart==0.0.20`。好处是失败得早；
+坏处是报错信息不直说"去装这个包"，第一次见会愣一下。
+
+### 坑 3：Content-Type 跟着 multipart 请求上车，boundary 被顶掉（ui_check 抓到的真 bug）
+
+`ctlHeaders()` 一直带着 `Content-Type: application/json`（JSON 请求需要它）。
+voice.js 的 `vFetch` 把它原样合并进 `FormData` 请求——手动指定的 Content-Type
+会**顶掉 fetch 自动生成的 multipart boundary**，服务端解析不到 `file` 字段，
+回 422 `{"detail":[{"loc":["body","file"],"msg":"Field required"}]}`。
+这不是打桩环境专属：**真实浏览器同样会挂**，只是手工点页面时没人看网络面板。
+修复：`vHeaders()` 检测 body 是 FormData 就删掉 Content-Type，只带令牌。
+
+发现它的过程比修复更值得记：`showErr` 直接读 `e.code`，遇到 422 这种
+契约外响应就进程级 TypeError——用户看到的是一片安静，测试看到的是崩溃栈。
+加了「服务端响应异常（HTTP xxx，缺 error 字段）+ 原始响应」的可见兜底后，
+422 的 body 自己浮出来了。"失败必须可见"对前端自身也成立：
+异常不变成文案，就等于被吞掉。
+
+### 坑 4：node 24 + DOM 桩跑录音链路的三个环境坑
+
+- node 24 的 global `navigator` 是只读 getter，直接赋值无效；
+  要桩 `getUserMedia` 只能 `Object.defineProperty(globalThis, 'navigator', ...)`。
+- DOM 桩的 `addEventListener` 是 no-op——按钮若这样绑事件，ui_check 永远"点"不到它。
+  统一 `onclick` / `onchange`（与 button.js 同风格，防抖断言才做得成）。
+- 桩 `<select>` 的 value 不跟随 option 变化，停在通用默认 `'3000'`，
+  真浏览器里填完选项 value 就是第一项。ui_check 里显式 `value='pc_microphone'`
+  对齐并注释原因——否则测出来的是 `bad_source` 而不是想测的 `voice_not_configured`。
+
+### 验证
+
+- `test_voice.py` 27 项（服务商接缝 monkeypatch 注入超时/500/坏 JSON，不需真 key）；
+  全量 187 passed（27+78+25+30+27，第1~5周），2026-09-24。
+- `ui_check.mjs` 第5周段退出码 0：错误码契约、来源 4 项、无麦克风降级可见、
+  `nl_text` 永不禁用、连点录音 getUserMedia=1、transcribe POST=1、
+  无 key 时界面如实显示 `voice_not_configured`、时间轴含"识别"。
+- 本机验证环境没有 `OPENAI_API_KEY`，跑通的是完整降级形态；
+  课堂真识别/真合成需要 key + 真麦克风（清单在 week5-voice.md 第 8 节）。
+
 ## 横向：三条一直用到的判断准则
 
 ### 1. 同一个事实不要存两处

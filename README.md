@@ -97,6 +97,7 @@ esp32-s3-eye-telemetry/
 │   ├── week2-commands.md            第2周：远程指令通道的设计与验证（状态机/协议/端点）
 │   ├── week3-button.md              第3周：按键闭环的设计与验证（含上板验证清单）
 │   ├── week4-assistant.md           第4周：自然语言助手的设计与验证（含两组必测场景）
+│   ├── week5-voice.md               第5周：语音链路的设计与验证（时序/错误契约/对照方法）
 │   ├── board-connect-checklist.md   插上板子网页没数据 → 排查清单（配 tools/doctor.py）
 │   └── 成果总结.md                   阶段性成果与当前状态
 ├── firmware/                        板端（PlatformIO + Arduino）
@@ -117,16 +118,19 @@ esp32-s3-eye-telemetry/
     ├── commands.py                  远程指令状态机：唯一一份实现，板端与测试共用编解码
     ├── buttons.py                   按键事件：幂等入库、事件三态、Web 回应（复用 commands）
     ├── test_ingest.py               27 项测试（第1周）
-    ├── test_commands.py             80 项测试（第2周）
+    ├── test_commands.py             78 项测试（第2周）
     ├── test_buttons.py              25 项测试（第3周，含状态防伪）
     ├── assistant.py                 第4周：自然语言意图翻译 + 白名单护栏 + 结构化错误
-    ├── test_assistant.py            26 项测试（第4周）
+    ├── test_assistant.py            30 项测试（第4周）
+    ├── voice.py                     第5周：语音链路——识别/合成/错误码目录/voice_events 溯源表
+    ├── test_voice.py                27 项测试（第5周）
     ├── requirements.txt
     ├── static/
-    │   ├── index.html               主界面：图表、指标卡、采集开关、指令面板、按键面板、助手面板
+    │   ├── index.html               主界面：图表、指标卡、采集开关、指令面板、按键面板、助手面板、语音面板
     │   ├── commands.js              指令面板逻辑（按钮/状态/详情/防抖）
     │   ├── button.js                按键事件面板（2s 轮询、回应/取消、重发入口）
-    │   └── assistant.js             自然语言助手面板逻辑（示例/结果渲染/写操作标黄）
+    │   ├── assistant.js             自然语言助手面板逻辑（示例/结果渲染/写操作标黄）
+    │   └── voice.js                 语音链路面板（四态状态机/录音/上传授权录音/同句对照/事件表）
     ├── tools/
     │   ├── doctor.py                一键体检：插上板子网页没数据时定位卡在哪（只读）
     │   ├── fix_firewall.ps1         修防火墙：禁用全局入站拦截 + 放行端口（自动提权）
@@ -134,7 +138,7 @@ esp32-s3-eye-telemetry/
     │   ├── command_sim.py           假设备模拟器 + 故障注入，打真实 HTTP（188 断言）
     │   ├── auto_serve.py            服务端守护：起/接管/崩溃自愈 + 插板自动弹看板 + 开机自启
     │   ├── nl_demo.py               第4周端到端验收：真实 HTTP + 假设备，覆盖两组必测场景
-    │   └── ui_check.mjs             DOM 打桩跑界面脚本，断言报警判定与各面板的防抖
+    │   └── ui_check.mjs             DOM 打桩跑界面脚本，断言报警判定、各面板防抖与第5周语音降级
     ├── .env.example                 配置模板 → 复制成 .env
     └── data/telemetry.db            运行期数据库，.gitignore 排除
 ```
@@ -458,6 +462,33 @@ off / degraded` 五值，**只有 `degraded`（配了 key 但调用失败）画�
 且**不下发任何指令**，设备不回返回 `device_no_response`。全部错误都是同一个 JSON 信封，
 `ask` 永远返回 HTTP 200（鉴权失败除外），不给调用方 500。
 
+### 语音链路（第5周）
+
+设计与取舍的完整说明见 [`docs/week5-voice.md`](docs/week5-voice.md)
+（含时序图、`voice_events` 字段表、13 个错误码与 HTTP 口径）。
+
+```
+浏览器录音 → POST /voice/transcribe → 识别文本 → POST /assistant/ask（第4周端点原样复用）
+          → 回答文本 → GET /voice/speak → <audio> 播放（503 时浏览器 speechSynthesis 兜底）
+          → POST /voice/events/{id}/played（播放结果如实回告，落 voice_events）
+```
+
+| 方法 | 路径 | 鉴权 | 作用 |
+|---|---|---|---|
+| GET | `/api/v1/voice/info` | 无 | 能力自述：来源 4 枚举、引擎与配置状态、大小/格式上限、错误码目录 |
+| POST | `/api/v1/voice/transcribe` | `X-Control-Token` | multipart 录音 → 识别文本；识别前先落 `voice_events` 行 |
+| POST | `/api/v1/voice/events/{id}/bind` | `X-Control-Token` | 回写任务结果：intent / assistant_ok / request_id |
+| POST | `/api/v1/voice/events/{id}/played` | `X-Control-Token` | 回写播放结果：played / tts_engine / tts_location |
+| GET | `/api/v1/voice/events` | 无（只读公开） | 事件列表（`limit` 1~200，默认 30） |
+| GET | `/api/v1/voice/speak?text=…` | `X-Control-Token` | 成功 `audio/mpeg`+`X-Voice-Engine`；失败 503+JSON（带 `fallback`） |
+
+**识别文本只是"一句用户文本"**：任务翻译与执行仍走第4周那份白名单护栏，
+语音链路没有一行执行代码；任何语音故障都不影响文字入口（ui_check 有断言守着）。
+`audio_source`（电脑麦克风/共享音频站/授权录音文件/设备麦克风）与
+`recognition_location` / `tts_location`（server/browser）逐条落库回显——
+声音从哪来、跑在哪，是事实不是形容词。不配 `OPENAI_API_KEY` 时如实报
+`voice_not_configured` / `tts_unavailable`，合成自动降级为浏览器 `speechSynthesis`。
+
 ### 数据契约
 
 #### `POST /api/v1/ingest` → 201，请求头 `X-Ingest-Token`
@@ -540,7 +571,7 @@ off / degraded` 五值，**只有 `degraded`（配了 key 但调用失败）画�
 
 ```bash
 cd server
-python -m pytest -q                                 # 156 项（27 + 80 + 25 + 26，第1~4周）
+python -m pytest -q                                 # 187 项（27 + 78 + 25 + 30 + 27，第1~5周）
 node tools/ui_check.mjs                   # 对着真实服务端跑界面脚本
 node tools/ui_check.mjs --origin http://127.0.0.1:8001
 python tools/command_sim.py --url http://127.0.0.1:8002   # 端到端 188 项断言
@@ -560,6 +591,12 @@ python -X utf8 tools/nl_demo.py --url http://127.0.0.1:8012   # 另开一个终�
 `press_seq` 从 0 重来必须是两条、Web 回应的 `client_token` 去重、非法 `decision`、
 claim 文本协议（`rid|notify|decision=ack;event_id=7|15000`）、done 回执后事件行回显、
 重发产生新指令、取消路径、`queue_dropped` 透传。
+
+`ui_check.mjs` 第5周加了语音面板断言：错误码契约 4 个关键码齐全、音频来源恰 4 项、
+无麦克风环境录音键必须禁用且降级提示指向「上传授权录音」、`nl_text` 永不被禁用、
+连点录音 `getUserMedia` 只调 1 次、`transcribe` 只 POST 1 次、无 key 时界面必须如实
+显示 `voice_not_configured` 文案——它还真抓到一个真 bug：`Content-Type: application/json`
+跟着 multipart 请求上车顶掉 boundary，服务端解析不到 `file` 字段回 422（见开发复盘阶段 18）。
 
 `ui_check.mjs` 同样加了按键面板：`notify` 的 `decision` 必须是从 `/commands/ops`
 读出来的 `ack/cancel` 下拉框（前端硬编码就挂），事件行必须渲染（空态也算一行，
@@ -614,6 +651,15 @@ python tools/fault_inject.py --url http://127.0.0.1:8001
   （刻意选择——宁可失败可见，也不要几分钟后突然闪灯）。界面给「重发」入口。
 - **按键事件只保留最近一次回应的 `request_id`**，历史回应要按
   `commands.params_json` 里的 `event_id` 反查。
+- **真识别/真合成需要 `OPENAI_API_KEY`**：不配 key 时语音链路如实降级
+  （`voice_not_configured` / `tts_unavailable`），文字入口不受影响——离线默认形态，不算故障。
+- **录音依赖浏览器 MediaRecorder**：容器与采样率由浏览器和设备决定（Chrome 桌面通常
+  webm/opus），服务端不重采样，原样送识别服务。
+- **设备麦克风只是枚举预留**：`device_microphone` 没有板端录音上传通道，
+  端侧课提供能力后再接；本周声音采集用电脑麦克风（课程允许的替代）。
+- **`speak` 是 GET + query、非流式**：文本 ≤4000 字符，首字节延迟等于整段合成时长。
+- **浏览器兜底合成的音质取决于系统语音包**：没有 zh-CN 语音时 `speechSynthesis`
+  会失败，如实回告 `played=0`，只剩文字回答，不假装播过。
 
 ## TODO
 
@@ -630,6 +676,9 @@ python tools/fault_inject.py --url http://127.0.0.1:8001
 - [ ] 物理反馈换/加执行器（振动马达或蜂鸣器），只改 `button_play_decision()`
 - [ ] 按键手势（长按/双击）：先决定判在板上还是服务端
 - [ ] `button_events` 的归档/清理策略（同上，第三张会长大的表）
+- [ ] 板端录音上传通道：I2S 麦克风接 `device_microphone` 来源（等端侧课能力）
+- [ ] `speak` 改 POST + 流式合成，降低长回答的首字节延迟
+- [ ] `voice_events` 的归档/清理策略（第四张只增不减的表）
 
 ---
 

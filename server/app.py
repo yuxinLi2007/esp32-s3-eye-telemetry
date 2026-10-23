@@ -17,6 +17,7 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+import assistant
 import commands
 import db
 
@@ -426,6 +427,33 @@ def command_result(request_id: str, payload: CommandResultIn, conn=Depends(get_c
         "ok": True,
         "command": commands.to_dict(row, commands.now_ms(),
                                     commands.events_of(conn, request_id)),
+    }
+
+
+# ============================================================ 第4周：自然语言入口
+#
+# 查询与请求采集分离：query 只读已有记录；collect 走 commands.create（改设备行为），
+# 因此 collect 才需要 CONTROL_TOKEN，query 不需要。判断在服务端做，
+# 前端没有任何"猜意图"的代码，也就没有"前端猜错了"的可能。
+
+
+class ChatIn(BaseModel):
+    text: str = Field(min_length=1, max_length=500)
+
+
+@app.post("/api/v1/assistant/chat")
+def assistant_chat(payload: ChatIn, request: Request, conn=Depends(get_conn)):
+    result = assistant.chat(conn, payload.text)
+    if result["intent"]["action"] == "collect":
+        # 会改变设备行为的操作，和采集开关、指令下发同级鉴权。
+        require_control_token(request)
+    return {
+        "ok": True,
+        "server_time_ms": int(time.time() * 1000),
+        "intent": result["intent"],
+        "answer": result["answer"],
+        "command": result["command"],
+        "error_code": result.get("error_code"),
     }
 
 

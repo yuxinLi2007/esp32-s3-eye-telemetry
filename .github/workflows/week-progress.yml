@@ -1,0 +1,134 @@
+# 单周粒度、状态驱动的周进度流水线
+#
+# 调度：每天北京时间 00:00 触发（UTC 16:00，cron "0 16 * * *"），一次只做一个周。
+# 门槛：不直接推 main、不自动合并、不重复开同一周的 PR、ui_check 不过不开 PR。
+#
+# 运行逻辑（与 scripts/next-week.mjs 一一对应）：
+#   1. 读 state/week-progress.json（优先本周开放 PR 的分支 > main）。
+#      若 inProgress 有值且对应 PR 未合并 → 本次继续该周（wait），不推进；
+#      否则 redo 队列非空 → 取 redo[0] 执行；否则执行 lastCompletedWeek + 1。
+#   2. 从 main 新建分支 week-N（redo 用 week-N-redo），只做这一周；
+#      新建时把 inProgress 作为独立 commit 提交到该分支并推送（状态随 PR 走，合并后入 main）。
+#   3. 开发（AGENT_CMD 配置了就用它跑 prompts/week-N.md；没配置则由外部的开发智能体接手）。
+#   4. ui_check：失败即停，保留日志，不开 PR，状态已回写 inProgress（下一轮继续）。
+#   5. 通过则开 PR（scripts/open-pr.mjs，标题 week-N: <摘要>），inProgress 记录 PR 号；
+#     PR 合并后由下一轮决策自动结清（推进 lastCompletedWeek / 移出 redo）。
+
+name: week-progress
+
+on:
+  schedule:
+    - cron: '0 16 * * *'   # = 北京时间 00:00（UTC+8）
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: week-progress
+  cancel-in-progress: false
+
+jobs:
+  drive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 配置 git 身份与推送地址
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: 状态机决策（读状态 → 结清合并 → 选周 → 建/复用分支 → 回写 inProgress）
+        id: decide
+        run: |
+          set -euo pipefail
+          mkdir -p .artifacts
+          node scripts/next-week.mjs | tee .artifacts/decide.json
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: 输出决策
+        id: emit
+        run: |
+          set -euo pipefail
+          echo "action=$(node -p 'JSON.parse(require("fs").readFileSync(".artifacts/decide.json","utf8")).action')" >> "$GITHUB_OUTPUT"
+          echo "week=$(node -p 'JSON.parse(require("fs").readFileSync(".artifacts/decide.json","utf8")).week ?? ""')" >> "$GITHUB_OUTPUT"
+          echo "branch=$(node -p 'JSON.parse(require("fs").readFileSync(".artifacts/decide.json","utf8")).branch ?? ""')" >> "$GITHUB_OUTPUT"
+          echo "redo=$(node -p 'JSON.parse(require("fs").readFileSync(".artifacts/decide.json","utf8")).isRedo')" >> "$GITHUB_OUTPUT"
+
+      - name: 执行本周开发（开发智能体；未配置则等待外部智能体接手）
+        if: steps.emit.outputs.action == 'do' || steps.emit.outputs.action == 'continue'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WEEK: ${{ steps.emit.outputs.week }}
+          BRANCH: ${{ steps.emit.outputs.branch }}
+          REDO: ${{ steps.emit.outputs.redo }}
+          AGENT_CMD: ${{ vars.AGENT_CMD }}
+          LLM_BASE_URL: ${{ vars.LLM_BASE_URL }}
+          LLM_MODEL: ${{ vars.LLM_MODEL }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+        run: |
+          set -euo pipefail
+          W="${{ steps.emit.outputs.week }}"
+          mkdir -p .artifacts
+          # 任务说明先复制出来（切到周分支后 main 上的 prompts/ 可能不在分支里）
+          cp "prompts/week-${W}.md" .artifacts/task.md
+          node scripts/next-week.mjs --checkout "${{ steps.emit.outputs.branch }}"
+          if [ -n "$AGENT_CMD" ]; then
+            echo "== 用 AGENT_CMD 执行本周任务：$AGENT_CMD"
+            eval "$AGENT_CMD"
+          else
+            echo "== 未配置 AGENT_CMD：本周任务说明在 .artifacts/task.md，"
+            echo "== 由外部开发智能体（本会话 DSH 每日调度）在分支 ${{ steps.emit.outputs.branch }} 上完成并推送。"
+          fi
+
+      - name: 校验并开 PR
+        if: steps.emit.outputs.action == 'do' || steps.emit.outputs.action == 'continue'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WEEK: ${{ steps.emit.outputs.week }}
+          BRANCH: ${{ steps.emit.outputs.branch }}
+          REDO: ${{ steps.emit.outputs.redo }}
+        run: |
+          set -euo pipefail
+          W="${{ steps.emit.outputs.week }}"
+          CHANGED=$(git rev-list --count origin/main..HEAD)
+          echo "分支相对 main 的提交数：$CHANGED"
+          if [ "$CHANGED" -eq 0 ]; then
+            echo "本周分支还没有实现提交，等待外部执行，不开 PR。"
+            exit 0
+          fi
+          python3 -m pip install -q -r server/requirements.txt
+          python3 server/tools/seed_ui.py --db "$RUNNER_TEMP/ui.db"
+          TELEMETRY_DB="$RUNNER_TEMP/ui.db" \
+            nohup python3 -m uvicorn app:app --host 127.0.0.1 --port 8000 --app-dir server \
+            > "$RUNNER_TEMP/server.log" 2>&1 &
+          SRV=$!
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8000/health >/dev/null 2>&1; then ok=1; break; fi
+            sleep 1
+          done
+          if [ "${ok:-0}" != 1 ]; then echo "服务端 30s 内未就绪"; cat "$RUNNER_TEMP/server.log"; kill $SRV 2>/dev/null || true; exit 1; fi
+          (cd server && node tools/ui_check.mjs --origin http://127.0.0.1:8000 2>&1 | tee ".artifacts/ui_check-week-${W}.log")
+          kill $SRV 2>/dev/null || true
+          # ui_check 失败时上面一行已以非 0 退出：日志随 artifact 保留、不开 PR、状态保持 inProgress
+          node scripts/open-pr.mjs --week "$W" --branch "${{ steps.emit.outputs.branch }}" --redo "${{ steps.emit.outputs.redo }}" \
+            --ui-check-log ".artifacts/ui_check-week-${W}.log"
+
+      - name: 上传本周日志（失败时也保留）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: week-${{ steps.emit.outputs.week || 'unknown' }}-artifacts
+          path: .artifacts/
+          if-no-files-found: ignore
+          retention-days: 14

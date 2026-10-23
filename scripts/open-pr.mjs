@@ -199,9 +199,13 @@ function main() {
     return;
   }
 
-  const created = JSON.parse(gh(['pr', 'create', '--repo', repoSlug(),
+  // gh pr create 不支持 --json；输出是 PR 地址（https://github.com/.../pull/N）
+  const createdOut = gh(['pr', 'create', '--repo', repoSlug(),
     '--base', 'main', '--head', branch, '--title', title,
-    '--body-file', bodyFile, '--json', 'number,title,url,state']));
+    '--body-file', bodyFile]);
+  const m = /\/pull\/(\d+)\/?$/.exec(createdOut.trim());
+  if (!m) throw new Error('无法从 gh pr create 输出解析 PR 编号: ' + createdOut);
+  const created = { number: parseInt(m[1], 10), title, url: createdOut.trim(), state: 'OPEN' };
 
   // 3) 回写 inProgress.pr
   const next = { ...state, inProgress: { week, redo: isRedo, branch, pr: created.number }, updatedAt: new Date().toISOString() };

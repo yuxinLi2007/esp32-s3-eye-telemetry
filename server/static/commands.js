@@ -95,12 +95,9 @@
     if (op === 'capture' && out.n !== undefined && out.interval_ms !== undefined) {
       const dur = out.n * out.interval_ms;
       if (dur > maxCaptureMs) {
-        // 这条限制不是服务端拍脑袋定的：采集期间板子不上传连续流，全靠 12 秒环形缓冲扛。
-        note('n × interval_ms = ' + dur + ' ms，超过上限 ' + maxCaptureMs +
-             ' ms（再长连续流缓冲就会溢出丢样）', true);
+        note('n × interval_ms = ' + dur + ' ms，超过上限 ' + maxCaptureMs + ' ms', true);
         return null;
       }
-      $('cmd_dur').textContent = '预计 ' + (dur / 1000).toFixed(1) + ' s';
     }
     return out;
   }
@@ -233,10 +230,6 @@
           inp.disabled = !!busyOp;
           box.appendChild(lab); box.appendChild(inp);
         }
-        box.appendChild(el('span', 'note', 'n≤' + spec.params[0].hi +
-          '，interval ' + spec.params[1].lo + '~' + spec.params[1].hi + ' ms，n×interval≤' +
-          maxCaptureMs + ' ms'));
-        box.appendChild(el('span', 'note', ''));
       }
       const b = el('button', 'btn op', spec.op);
       b.title = spec.desc;
@@ -245,9 +238,6 @@
       b.onclick = () => send(spec.op);
       box.appendChild(b);
     }
-    const dur = el('span', 'note', '');
-    dur.id = 'cmd_dur';
-    box.appendChild(dur);
   }
 
   function renderStats() {
@@ -316,8 +306,7 @@
       tdN.textContent = srv + ' / ' + dev;
       if (c.sample_count_mismatch) {
         tdN.classList.add('mismatch');
-        tdN.title = '设备自报与服务端实收不一致：有样本在上传途中丢了';
-        tdN.textContent += ' ⚠';
+        tdN.title = '设备自报与服务端实收不一致，有样本在上传途中丢了';
       }
       tr.appendChild(tdN);
 
@@ -363,11 +352,9 @@
     add('执行者', c.claimed_boot_id ? 'boot_id=' + c.claimed_boot_id + '　fw=' + (c.claimed_fw || '—') : '—');
     add('结束时刻', c.t_finished_ms ? fmtTime(c.t_finished_ms) + '（执行 ' + fmtAge(c.exec_ms) + '）' : '—');
     add('尝试次数', c.attempts + ' / 上限 ' + c.max_attempts + '（重排队 ' + c.requeues + ' 次）');
-    add('超时口径', 'ttl ' + fmtAge(c.ttl_ms) + ' 内未被领取 → expired；领取后静默 ' +
-        fmtAge(c.timeout_ms) + ' → 重排队或 timeout（锚点是最后一次有动静的时刻，进度心跳可续命）');
     add('样本数', '服务端实收 ' + (c.n_samples === null ? '—' : c.n_samples) +
         '　设备自报 ' + (c.n_samples_device === null ? '—' : c.n_samples_device) +
-        (c.sample_count_mismatch ? '　⚠ 不一致，有样本在上传途中丢了' : ''));
+        (c.sample_count_mismatch ? '　不一致，有样本在上传途中丢了' : ''));
     add('备注', c.note);
     if (c.error_code) add('错误码', c.error_code + (c.error_message ? '　' + c.error_message : ''));
     wrap.appendChild(kv);
@@ -380,11 +367,6 @@
 
     if (samples) {
       wrap.appendChild(el('h3', null, '这条指令采到的样本（' + samples.count + ' 个）'));
-      const n2 = el('div', 'note',
-        '这些样本不会出现在上方的连续流图表与样本表里（服务端默认按 request_id 把它们分流，' +
-        '当前窗口共排除 ' + samples.excluded_command_samples + ' 个指令样本）。' +
-        '两条流各自独立计 seq，混在一起会算出假缺口。');
-      wrap.appendChild(n2);
       const tw = el('div', 'tablewrap');
       const t = el('table');
       t.innerHTML = '<thead><tr><th class="l">seq</th><th>设备时间</th><th>ax</th>' +
@@ -486,7 +468,6 @@
         const st = await sr.json();
         if (st.last_batch && st.last_batch.device_mac && !$('cmd_mac').value) {
           $('cmd_mac').value = st.last_batch.device_mac;
-          $('cmd_mac_hint').textContent = '（已按最近一批数据自动填入）';
         }
       }
     } catch (e) { /* 填不上就让用户自己填，不值得报错 */ }

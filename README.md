@@ -365,6 +365,19 @@ sudo journalctl -u telemetry -f
 但会在 `excluded_command_samples` 里如实报出过滤了多少条，
 加 `?request_id=xxx` 或 `?include_command_samples=true` 才看得到。
 
+### 自然语言入口（第4周）
+
+| 方法 | 路径 | 鉴权 | 作用 |
+|---|---|---|---|
+| POST | `/api/v1/assistant/chat` | 仅请求采集时需 `X-Control-Token` | 查询 `/` 请求采集，按真实结果回答 |
+
+“查看数据”只读已有记录、绝不改设备行为；“重新采集”走上面的指令通道下发一条
+`capture`（参数与设备范围都过服务端唯一一份校验）。回答由真实结果驱动：
+指令刚下发只说“已受理/等待设备执行”并附 `request_id`，只有设备回执完成**且服务端
+实收样本**才报“采集完成”，绝不以设备自报为准空口报成功。语言模型（`LLM_BASE_URL /
+LLM_API_KEY / LLM_MODEL` 配置）只服务意图解析，解析失败/超时/无密钥自动降级到
+确定性关键字规则，任何情况下都有答复。
+
 ### 数据契约
 
 #### `POST /api/v1/ingest` → 201，请求头 `X-Ingest-Token`

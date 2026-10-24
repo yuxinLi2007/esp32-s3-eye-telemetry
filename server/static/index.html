@@ -114,6 +114,8 @@
            placeholder="自然语言：查看数据 / 重新采集">
     <button class="btn" id="ask_btn">发送</button>
     <button class="btn" id="ptt_btn" title="按下开始录音，再按停止">按讲</button>
+    <button class="btn halt" id="vt_stop" title="停止当前任务：停播报、撤销/停止关注、回空闲"
+            style="display:none">停止</button>
     <span class="vstates" title="录音中 · 识别中 · 执行中 · 播放中">
       <i class="dot" id="st_rec"></i><i class="dot" id="st_asr"></i>
       <i class="dot" id="st_run"></i><i class="dot" id="st_play"></i>
@@ -549,16 +551,18 @@ function pollCommand(rid, box, onTerminal) {
 }
 
 async function askText(text) {
-  // 文字入口与语音入口共用同一条 NL 处理：查询/采集/澄清全复用，不另写一套。
+  // 文字入口与语音入口共用同一条 NL 处理：查询/采集/澄清/取消全复用，不另写一套。
   let r = await fetch(api('/api/v1/assistant/chat'), {
-    method: 'POST', headers: ctlHeaders(), body: JSON.stringify({ text }),
+    method: 'POST', headers: ctlHeaders(),
+    body: JSON.stringify({ text, context_id: VOICE_CTX }),
   });
   if (r.status === 401) {
-    const t = window.prompt('服务端设置了 CONTROL_TOKEN，请求采集需要它：');
+    const t = window.prompt('服务端设置了 CONTROL_TOKEN，请求采集/取消需要它：');
     if (!t) throw new Error('未提供 CONTROL_TOKEN');
     ctlToken = t; try { localStorage.setItem('ctl_token', t); } catch (e) {}
     r = await fetch(api('/api/v1/assistant/chat'), {
-      method: 'POST', headers: ctlHeaders(), body: JSON.stringify({ text }),
+      method: 'POST', headers: ctlHeaders(),
+      body: JSON.stringify({ text, context_id: VOICE_CTX }),
     });
   }
   if (!r.ok) {
@@ -573,11 +577,17 @@ async function onAsk() {
   const text = $('ask_in').value.trim();
   if (!text) return;
   clearInterval(askTimer);
+  voiceEpoch++; stopSpeaking();          // 文字新输入 = 新任务：打断旧播报
   const out = $('ask_out');
   out.innerHTML = '';
   try {
     const j = await askText(text);
+    if (isCancelIntent(j)) {
+      appendMsg(j.answer); applyTiming(j);
+      return;
+    }
     out.appendChild(el('div', 'ans', j.answer));
+    applyTiming(j);
     if (j.command) {
       const box = el('div', 'stat');
       out.appendChild(box);
@@ -592,6 +602,16 @@ async function onAsk() {
 // 半双工：一次只走一个环节。录音中/识别中/执行中/播放中是四个色点（红=进行中）。
 let rec = null, recChunks = [], recStream = null;
 
+// ------------------------------------------------------------ 第6周：可澄清、可停止
+// 会话上下文：整页自持一个 context_id（服务端按它记录澄清/取消/时序）。
+// epoch：新任务 / 取消时 +1；迟到应答（旧任务的 TTS、迟到的指令终态播报）
+// 一律按 epoch 对不上号丢弃——"新任务不被旧任务结果覆盖"的前端一半。
+const VOICE_CTX = (globalThis.crypto && crypto.randomUUID
+                  ? crypto.randomUUID()
+                  : 'c' + Date.now().toString(36) + Math.random().toString(36).slice(2, 14));
+let voiceEpoch = 0;
+let ttsAudio = null;
+
 function setDot(which) {
   for (const k of ['rec', 'asr', 'run', 'play']) {
     const d = $('st_' + k);
@@ -605,6 +625,7 @@ function appendMsg(msg) {
 
 async function pttStart() {
   if (rec) return;
+  voiceEpoch++; stopSpeaking();          // 新语音任务：打断旧播报，旧任务应答作废
   clearInterval(askTimer);
   $('ask_out').innerHTML = '';
   setDot('rec');
@@ -634,6 +655,7 @@ async function onPttStop() {
   const mr = rec; rec = null;
   const blob = new Blob(recChunks, { type: (mr && mr.mimeType) || 'audio/webm' });
   if (!blob.size) { setDot(null); appendMsg('识别失败：无有效语音'); return; }
+  const myEpoch = voiceEpoch;              // 本次语音任务快照：迟到应答对不上号就丢
   setDot('asr');
   try {
     const fd = new FormData();
@@ -645,26 +667,78 @@ async function onPttStop() {
     }
     const text = (await r.json()).text;
     if (!text) throw new Error('识别失败：无有效语音');
-    // 识别出的文本走第 4 周同一条 NL 处理（查询/采集/澄清全复用）
+    // 识别出的文本走第 4 周同一条 NL 处理（查询/采集/澄清/取消全复用）
     setDot('run');
     const j = await askText(text);
+    if (voiceEpoch !== myEpoch) return;    // 已取消/被新任务顶掉：迟到应答不播不显示
     appendMsg(j.answer);
+    applyTiming(j);
+    if (isCancelIntent(j)) {
+      // 语音口令"取消/停止"：播报一句确认即可，其余内容一律不碰
+      await ttsSpeak(j.answer, myEpoch);
+      return;
+    }
     if (j.command) {
       // 采集：等指令终态后再播报"最终回答"，避免把中间态说成结果。
       const box = el('div', 'stat');
       $('ask_out').appendChild(box);
-      pollCommand(j.command.request_id, box, t => ttsSpeak(t));
+      pollCommand(j.command.request_id, box, async t => {
+        if (voiceEpoch !== myEpoch) return; // 迟到终态：任务已被取消/顶掉，不播
+        try {
+          const rc = await fetch(api('/api/v1/voice/context')
+            + '?context_id=' + encodeURIComponent(VOICE_CTX), { cache: 'no-store' });
+          const jc = await rc.json();
+          const tl = jc.context && jc.context.timing;
+          if (tl && tl.latency_ms != null) appendMsg('⏱ 完成延迟 ' + tl.latency_ms + 'ms');
+        } catch (e) { /* 拿不到计时不影响播报 */ }
+        ttsSpeak(t, myEpoch);
+      });
       return;
     }
-    await ttsSpeak(j.answer);
+    await ttsSpeak(j.answer, myEpoch);
   } catch (e) {
+    if (voiceEpoch !== myEpoch) return;
     setDot(null);
     appendMsg(String(e.message || e));
   }
 }
 
-async function ttsSpeak(text) {
+// 第6周：停止播报 + 回到空闲
+function stopSpeaking() {
+  if (ttsAudio) {
+    try { ttsAudio.pause(); ttsAudio.src = ''; } catch (e) {}
+    ttsAudio = null;
+  }
+  setDot(null);
+  clearInterval(askTimer);
+}
+
+// 文字停止按钮（备用路径）：停播报、断轮询，让服务端撤销/停止关注
+function doCancel() {
+  voiceEpoch++;
+  stopSpeaking();
+  appendMsg('已停止播报，正在撤销任务…');
+  askText('取消')
+    .then(j => {
+      appendMsg(j.answer);
+      applyTiming(j);
+    })
+    .catch(e => appendMsg(String(e.message || e)));
+}
+
+function isCancelIntent(j) {
+  return !!(j && j.intent && j.intent.action === 'cancel');
+}
+
+// 首答延迟展示（输入结束 → 首次反馈）
+function applyTiming(j) {
+  const t = j && j.context && j.context.timing;
+  if (t && t.ttff_ms != null) appendMsg('⏱ 首答 ' + t.ttff_ms + 'ms');
+}
+
+async function ttsSpeak(text, epoch = voiceEpoch) {
   if (!text) return;
+  if (epoch !== voiceEpoch) return;        // 迟到：已被取消/新任务顶掉
   setDot('play');
   try {
     const r = await fetch(api('/api/v1/voice/speak'), {
@@ -675,15 +749,18 @@ async function ttsSpeak(text) {
       let d = null; try { d = await r.json(); } catch (e) {}
       throw new Error((d && d.error && d.error.message) || '合成失败：HTTP ' + r.status);
     }
+    if (epoch !== voiceEpoch) return;      // 合成回来前已被打断
     const audio = new Audio(URL.createObjectURL(await r.blob()));
+    ttsAudio = audio;
     await new Promise(res => {
-      audio.onended = res; audio.onerror = res;
-      audio.play().catch(() => res());
+      audio.onended = () => { if (ttsAudio === audio) ttsAudio = null; res(); };
+      audio.onerror = () => { if (ttsAudio === audio) ttsAudio = null; res(); };
+      audio.play().catch(() => { if (ttsAudio === audio) ttsAudio = null; res(); });
     });
   } catch (e) {
     appendMsg(String(e.message || e));
   } finally {
-    setDot(null);
+    if (epoch === voiceEpoch) setDot(null);
   }
 }
 
@@ -704,6 +781,7 @@ $('btn_stop').addEventListener('click', () => onControl(false));
 $('ask_btn').addEventListener('click', onAsk);
 $('ask_in').addEventListener('keydown', ev => { if (ev.key === 'Enter') onAsk(); });
 $('ptt_btn').addEventListener('click', () => { if (rec) pttStop(); else pttStart(); });
+$('vt_stop').addEventListener('click', doCancel);
 window.addEventListener('resize', tick);
 tick();
 setInterval(tick, UPLOAD_INTERVAL_MS);

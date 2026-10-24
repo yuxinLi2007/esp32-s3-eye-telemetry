@@ -1,14 +1,13 @@
 {
-  "lastCompletedWeek": 3,
-  "redo": [
-    4,
-    5
-  ],
-  "inProgress": {
-    "week": 4,
-    "redo": true,
-    "branch": "week-4-redo",
-    "pr": 6
-  },
-  "updatedAt": "2026-10-23T15:53:50.183Z"
+    "lastCompletedWeek":  4,
+    "redo":  [
+                 5
+             ],
+    "inProgress":  {
+                       "week":  5,
+                       "redo":  true,
+                       "branch":  "week-5-redo",
+                       "pr":  7
+                   },
+    "updatedAt":  "2026-10-24T04:43:07.598Z"
 }

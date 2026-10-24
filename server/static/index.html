@@ -46,6 +46,14 @@
   .ans { margin:2px 0; }
   .stat { color:var(--dim); }
 
+  /* 第5周：四态色点（录音/识别/执行/播放）+ 运行位置标注 */
+  .vstates { display:inline-flex; gap:5px; align-items:center; margin-left:2px; }
+  .dot { width:9px; height:9px; border-radius:50%; background:#d8d8d8;
+         display:inline-block; }
+  .dot.on { background:var(--crit); animation:pulse 1s ease-in-out infinite; }
+  @keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:.35; } }
+  .origin { font-size:10px; color:var(--dim); margin-left:2px; }
+
   input[type=text], input[type=number] { background:#fff; color:var(--fg);
       border:1px solid var(--line); border-radius:6px; padding:4px 8px; font:inherit; }
   input[type=text] { width:170px; }
@@ -105,6 +113,12 @@
     <input type="text" id="ask_in" spellcheck="false" maxlength="500"
            placeholder="自然语言：查看数据 / 重新采集">
     <button class="btn" id="ask_btn">发送</button>
+    <button class="btn" id="ptt_btn" title="按下开始录音，再按停止">按讲</button>
+    <span class="vstates" title="录音中 · 识别中 · 执行中 · 播放中">
+      <i class="dot" id="st_rec"></i><i class="dot" id="st_asr"></i>
+      <i class="dot" id="st_run"></i><i class="dot" id="st_play"></i>
+      <span class="origin" id="voice_origin">电脑音频·浏览器</span>
+    </span>
     <div id="ask_out"></div>
   </section>
 
@@ -516,7 +530,7 @@ function renderCommandState(c, box) {
   box.textContent = line;
 }
 
-function pollCommand(rid, box) {
+function pollCommand(rid, box, onTerminal) {
   clearInterval(askTimer);
   const step = async () => {
     try {
@@ -524,11 +538,35 @@ function pollCommand(rid, box) {
       if (!r.ok) return;
       const c = (await r.json()).command;
       renderCommandState(c, box);
-      if (c.is_terminal) clearInterval(askTimer);
+      if (c.is_terminal) {
+        clearInterval(askTimer);
+        if (onTerminal) onTerminal(box.textContent);
+      }
     } catch (e) { /* 状态轮询失败不打断其它逻辑 */ }
   };
   step();
   askTimer = setInterval(step, 2000);
+}
+
+async function askText(text) {
+  // 文字入口与语音入口共用同一条 NL 处理：查询/采集/澄清全复用，不另写一套。
+  let r = await fetch(api('/api/v1/assistant/chat'), {
+    method: 'POST', headers: ctlHeaders(), body: JSON.stringify({ text }),
+  });
+  if (r.status === 401) {
+    const t = window.prompt('服务端设置了 CONTROL_TOKEN，请求采集需要它：');
+    if (!t) throw new Error('未提供 CONTROL_TOKEN');
+    ctlToken = t; try { localStorage.setItem('ctl_token', t); } catch (e) {}
+    r = await fetch(api('/api/v1/assistant/chat'), {
+      method: 'POST', headers: ctlHeaders(), body: JSON.stringify({ text }),
+    });
+  }
+  if (!r.ok) {
+    let d = null;
+    try { d = await r.json(); } catch (e) {}
+    throw new Error((d && d.error && d.error.message) || 'HTTP ' + r.status);
+  }
+  return await r.json();
 }
 
 async function onAsk() {
@@ -538,23 +576,7 @@ async function onAsk() {
   const out = $('ask_out');
   out.innerHTML = '';
   try {
-    let r = await fetch(api('/api/v1/assistant/chat'), {
-      method: 'POST', headers: ctlHeaders(), body: JSON.stringify({ text }),
-    });
-    if (r.status === 401) {
-      const t = window.prompt('服务端设置了 CONTROL_TOKEN，请求采集需要它：');
-      if (!t) throw new Error('未提供 CONTROL_TOKEN');
-      ctlToken = t; try { localStorage.setItem('ctl_token', t); } catch (e) {}
-      r = await fetch(api('/api/v1/assistant/chat'), {
-        method: 'POST', headers: ctlHeaders(), body: JSON.stringify({ text }),
-      });
-    }
-    if (!r.ok) {
-      let d = null;
-      try { d = await r.json(); } catch (e) {}
-      throw new Error((d && d.error && d.error.message) || 'HTTP ' + r.status);
-    }
-    const j = await r.json();
+    const j = await askText(text);
     out.appendChild(el('div', 'ans', j.answer));
     if (j.command) {
       const box = el('div', 'stat');
@@ -566,10 +588,122 @@ async function onAsk() {
   }
 }
 
+// ------------------------------------------------------------ 第5周：按键说话
+// 半双工：一次只走一个环节。录音中/识别中/执行中/播放中是四个色点（红=进行中）。
+let rec = null, recChunks = [], recStream = null;
+
+function setDot(which) {
+  for (const k of ['rec', 'asr', 'run', 'play']) {
+    const d = $('st_' + k);
+    if (d) d.classList.toggle('on', k === which);
+  }
+}
+
+function appendMsg(msg) {
+  $('ask_out').appendChild(el('div', 'ans', msg));
+}
+
+async function pttStart() {
+  if (rec) return;
+  clearInterval(askTimer);
+  $('ask_out').innerHTML = '';
+  setDot('rec');
+  try {
+    recStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  } catch (e) {
+    setDot(null);
+    appendMsg('录音失败：麦克风不可用');
+    return;
+  }
+  recChunks = [];
+  rec = new MediaRecorder(recStream);
+  rec.ondataavailable = ev => { if (ev.data && ev.data.size) recChunks.push(ev.data); };
+  rec.onstop = onPttStop;
+  rec.start();
+  $('ptt_btn').textContent = '停止';
+}
+
+function pttStop() {
+  if (!rec) return;
+  rec.stop();
+  if (recStream) { recStream.getTracks().forEach(t => t.stop()); recStream = null; }
+  $('ptt_btn').textContent = '按讲';
+}
+
+async function onPttStop() {
+  const mr = rec; rec = null;
+  const blob = new Blob(recChunks, { type: (mr && mr.mimeType) || 'audio/webm' });
+  if (!blob.size) { setDot(null); appendMsg('识别失败：无有效语音'); return; }
+  setDot('asr');
+  try {
+    const fd = new FormData();
+    fd.append('file', blob, 'ptt.webm');
+    let r = await fetch(api('/api/v1/voice/transcribe'), { method: 'POST', body: fd });
+    if (!r.ok) {
+      let d = null; try { d = await r.json(); } catch (e) {}
+      throw new Error((d && d.error && d.error.message) || '识别失败：HTTP ' + r.status);
+    }
+    const text = (await r.json()).text;
+    if (!text) throw new Error('识别失败：无有效语音');
+    // 识别出的文本走第 4 周同一条 NL 处理（查询/采集/澄清全复用）
+    setDot('run');
+    const j = await askText(text);
+    appendMsg(j.answer);
+    if (j.command) {
+      // 采集：等指令终态后再播报"最终回答"，避免把中间态说成结果。
+      const box = el('div', 'stat');
+      $('ask_out').appendChild(box);
+      pollCommand(j.command.request_id, box, t => ttsSpeak(t));
+      return;
+    }
+    await ttsSpeak(j.answer);
+  } catch (e) {
+    setDot(null);
+    appendMsg(String(e.message || e));
+  }
+}
+
+async function ttsSpeak(text) {
+  if (!text) return;
+  setDot('play');
+  try {
+    const r = await fetch(api('/api/v1/voice/speak'), {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text }),
+    });
+    if (!r.ok) {
+      let d = null; try { d = await r.json(); } catch (e) {}
+      throw new Error((d && d.error && d.error.message) || '合成失败：HTTP ' + r.status);
+    }
+    const audio = new Audio(URL.createObjectURL(await r.blob()));
+    await new Promise(res => {
+      audio.onended = res; audio.onerror = res;
+      audio.play().catch(() => res());
+    });
+  } catch (e) {
+    appendMsg(String(e.message || e));
+  } finally {
+    setDot(null);
+  }
+}
+
+(async () => {
+  // 运行位置：服务端如实告诉你音频来源（设备音频已接通才标"设备音频"）
+  try {
+    const r = await fetch(api('/api/v1/voice/info'), { cache: 'no-store' });
+    if (r.ok) {
+      const j = await r.json();
+      $('voice_origin').textContent =
+        j.device_audio ? '设备音频·板载I2S' : '电脑音频·浏览器';
+    }
+  } catch (e) { /* 拿不到就保持默认标注 */ }
+})();
+
 $('btn_start').addEventListener('click', () => onControl(true));
 $('btn_stop').addEventListener('click', () => onControl(false));
 $('ask_btn').addEventListener('click', onAsk);
 $('ask_in').addEventListener('keydown', ev => { if (ev.key === 'Enter') onAsk(); });
+$('ptt_btn').addEventListener('click', () => { if (rec) pttStop(); else pttStart(); });
 window.addEventListener('resize', tick);
 tick();
 setInterval(tick, UPLOAD_INTERVAL_MS);

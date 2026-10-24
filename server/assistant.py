@@ -250,7 +250,7 @@ def parse_intent(text, devices):
             return {"action": "refuse", "device_mac": None, "params": {},
                     "reason": "本系统还没有见过任何设备上报数据，无法请求采集。"}
         if len(devices) > 1:
-            return {"action": "clarify", "device_mac": None, "params": {},
+            return {"action": "clarify", "device_mac": None, "params": params,
                     "reason": "检测到多台已知设备：%s；请说明针对哪一台。"
                               % "、".join(sorted(devices))}
         return {"action": action, "device_mac": devices[0], "params": params,

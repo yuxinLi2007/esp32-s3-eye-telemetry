@@ -165,6 +165,19 @@ def test_clarify_exhausts_after_two_wrong_answers(client):
     assert "clarify_exhausted" in events_of(j3)
 
 
+def test_clarify_keeps_task_params_across_rounds(client):
+    """澄清换设备时，用户原话里的采集参数（数量/间隔）必须跟着任务走。"""
+    seed_batch(client, mac=MAC)
+    seed_batch(client, mac=MAC2)
+    ctx = cid()
+    j1 = chat(client, "重新采集 50 条", ctx).json()
+    assert j1["intent"]["action"] == "clarify"
+    assert j1["context"]["pending"]["intent"]["params"].get("n") == 50
+    j2 = chat(client, "第一台", ctx).json()
+    assert j2["intent"]["action"] == "collect"
+    assert j2["command"]["params"]["n"] == 50
+
+
 def test_new_full_intent_during_pending_starts_new_task(client):
     seed_batch(client, mac=MAC)
     seed_batch(client, mac=MAC2)

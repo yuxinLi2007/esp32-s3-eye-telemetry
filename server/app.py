@@ -20,6 +20,7 @@ from pydantic import BaseModel, Field
 import assistant
 import commands
 import db
+import voice
 
 DB_PATH = os.environ.get(
     "TELEMETRY_DB", str(Path(__file__).parent / "data" / "telemetry.db")
@@ -295,6 +296,15 @@ async def command_error_handler(_request: Request, exc: commands.CommandError):
     )
 
 
+@app.exception_handler(voice.VoiceError)
+async def voice_error_handler(_request: Request, exc: voice.VoiceError):
+    """语音链路（第5周）的错误出口，口径同上：code + message 一起返回。"""
+    return JSONResponse(
+        status_code=exc.http_status,
+        content={"ok": False, "error": {"code": exc.code, "message": exc.message}},
+    )
+
+
 class CommandCreate(BaseModel):
     device_mac: str
     op: str
@@ -455,6 +465,39 @@ def assistant_chat(payload: ChatIn, request: Request, conn=Depends(get_conn)):
         "command": result["command"],
         "error_code": result.get("error_code"),
     }
+
+
+# ============================================================ 第5周：语音链路
+#
+# 转写 / 合成都是"只读"操作（不改变设备行为），鉴权口径与第 4 周"查询"一致（匿名）：
+# 语音服务的密钥只存在服务端环境变量（VOICE_*），前端和设备的请求里从不携带密钥。
+# 未配置 / 超时 / 无语音 / 服务报错统一走 voice.VoiceError 出口（带错误码），
+# 不做任何"假装成功"。
+
+
+class SpeakIn(BaseModel):
+    text: str = Field(min_length=1, max_length=500)
+
+
+@app.get("/api/v1/voice/info")
+def voice_info():
+    """运行位置与配置状态：界面据此如实标注音频来源（电脑音频 vs 设备音频）。"""
+    return voice.info()
+
+
+@app.post("/api/v1/voice/transcribe")
+async def voice_transcribe(request: Request):
+    """音频 -> 文本（ASR）。失败时返回 4xx/5xx + error.code，绝无假文本。"""
+    audio = await request.body()
+    text = voice.transcribe(audio, request.headers.get("content-type"))
+    return {"ok": True, "text": text}
+
+
+@app.post("/api/v1/voice/speak")
+def voice_speak(payload: SpeakIn):
+    """文本 -> 合成音频字节流（TTS）。合成失败时返回 4xx/5xx + error.code。"""
+    data, media = voice.speak(payload.text)
+    return Response(content=data, media_type=media)
 
 
 # 界面挂在最后：Starlette 按注册顺序匹配，先注册的 /api 与 /health 不会被它抢走。

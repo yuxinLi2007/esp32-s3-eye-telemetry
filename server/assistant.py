@@ -34,6 +34,7 @@ import httpx
 
 import commands
 import db
+import task_context
 
 # 查询结果"新鲜"的门槛：超过这个时间就不再当作当前状态
 QUERY_STALE_MS = 60_000
@@ -55,6 +56,12 @@ QUERY_WORDS = (
 STATUS_WORDS = (
     "采集结果", "完成没有", "完成了吗", "好了吗", "成功了吗", "采完了",
     "有没有采到", "采到没有", "采到了吗", "有结果",
+)
+# 第6周：用户反悔 / 想停 —— 取消当前任务（含未领取的采集指令）、停止播报、回空闲。
+# "停止采集" 在这里也归取消类：用户主观上是不想要这次采集了，交给取消语义处理。
+CANCEL_WORDS = (
+    "取消", "撤销", "算了", "别采了", "不采了", "不要了", "停下来",
+    "停止采集", "停止播报", "别说了", "闭嘴", "停了吧", "别播了", "停",
 )
 
 TRUST_TEXT = {
@@ -86,6 +93,9 @@ def extract_mac(text):
 
 # ---------------------------------------------------------------- 确定性规则
 def _keyword_action(text):
+    # 取消优先于一切：用户反悔/喊停时，绝不解释成"再来一次"
+    if any(w in text for w in CANCEL_WORDS):
+        return "cancel"
     has_collect = any(w in text for w in COLLECT_WORDS)
     has_query = any(w in text for w in QUERY_WORDS)
     if has_collect and has_query:
@@ -124,7 +134,7 @@ def _parse_llm_json(content):
     if not isinstance(obj, dict):
         return None
     action = obj.get("action")
-    if action not in ("query", "collect"):
+    if action not in ("query", "collect", "cancel"):
         return None
     out = {"action": action}
     mac = obj.get("device_mac")
@@ -147,12 +157,13 @@ def _ask_llm(text):
         "model": model,
         "messages": [
             {"role": "system", "content": (
-                "你是遥测系统的自然语言入口。把用户的请求分类成两种任务之一，"
+                "你是遥测系统的自然语言入口。把用户的请求分类成三类任务之一，"
                 "只输出一个 JSON 对象，不要输出其它文字：\n"
                 "1) 查看已有数据：{\"action\":\"query\"}\n"
                 "2) 请求设备重新采集：{\"action\":\"collect\","
                 "\"device_mac\":\"AA:BB:CC:DD:EE:FF\"或null,"
                 "\"n\":\"样本数\"或null,\"interval_ms\":\"间隔毫秒\"或null}\n"
+                "3) 取消/停止当前任务：{\"action\":\"cancel\"}\n"
                 "设备 MAC 只在用户明确给出时填写；n / interval_ms 只在用户明确提出时填写。")},
             {"role": "user", "content": text},
         ],
@@ -218,6 +229,11 @@ def parse_intent(text, devices):
                 "reason": "没听懂要做什么。可以说“查看数据”看最近状态，"
                           "或说“重新采集”让设备再采一次。"}
 
+    if action == "cancel":
+        # 取消/停止：不关心设备与参数，取消的是"当前进行中的任务"
+        return {"action": "cancel", "device_mac": None, "params": {},
+                "reason": "取消当前任务"}
+
     mac_in = extract_mac(t)
     device = mac_in or (llm_mac if llm else None)
     if device:
@@ -234,7 +250,7 @@ def parse_intent(text, devices):
             return {"action": "refuse", "device_mac": None, "params": {},
                     "reason": "本系统还没有见过任何设备上报数据，无法请求采集。"}
         if len(devices) > 1:
-            return {"action": "clarify", "device_mac": None, "params": {},
+            return {"action": "clarify", "device_mac": None, "params": params,
                     "reason": "检测到多台已知设备：%s；请说明针对哪一台。"
                               % "、".join(sorted(devices))}
         return {"action": action, "device_mac": devices[0], "params": params,
@@ -356,28 +372,203 @@ def status_answer(conn):
 
 
 # ---------------------------------------------------------------- 对外入口
-def chat(conn, text):
-    """一次自然语言对话。返回 {intent, answer, command, error_code}。
+def _observe_active_terminal(conn, ctx):
+    """懒结算：会话里挂着的采集指令若已进终态，记录完成延迟并清空 active。
 
-    只有 action == collect 才会走 commands.create（改变设备行为），
-    因此也只有这个分支需要 CONTROL_TOKEN（app 层做）。
+    跟 status/命令列表一样的"轮询时顺手结账"思路：不需要后台线程，
+    任何一次后续对话或 context 查询都会把时序账结掉。
     """
-    devices = known_devices(conn)
-    intent = parse_intent(text, devices)
+    active = ctx.get("active")
+    if not active:
+        return
+    rid = active["request_id"]
+    try:
+        c = commands.get_command(conn, rid, with_events=False)
+    except commands.CommandError:
+        return
+    if c["state"] in commands.TERMINAL:
+        t_terminal = c.get("t_finished_ms") or commands.now_ms()
+        task_context.observe_terminal(ctx["context_id"], rid, t_terminal)
+
+
+def _cn_num(s) -> int | None:
+    table = {"一": 1, "两": 2, "二": 2, "三": 3, "四": 4, "五": 5,
+             "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
+    if s.isdigit():
+        return int(s)
+    return table.get(s)
+
+
+def _resolve_pick_device(text, intent, devices):
+    """澄清"选哪台设备"的后续输入：
+    直接给 MAC → 用之；说"第 N 台 / N 号" → 取排序后第 N 台。解析不了返回 None。"""
+    mac = extract_mac(text)
+    if mac:
+        return {**intent, "device_mac": mac} if mac in devices else None
+    m = re.search(r"第\s*([一二三四五六七八九十\d两]+)\s*台", text or "")
+    if not m:
+        m = re.search(r"([一二三四五六七八九十\d两]+)\s*号", text or "")
+    if m:
+        idx = _cn_num(m.group(1))
+        if idx and 1 <= idx <= len(devices):
+            return {**intent, "device_mac": sorted(devices)[idx - 1]}
+    return None
+
+
+def _cancel_answer(conn, ctx):
+    """第6周取消：未领取的采集指令真撤销；已领取/执行中的停止关注；回空闲。"""
+    ctx_id = ctx["context_id"]
+    active = ctx.get("active")
+    rid = (active or {}).get("request_id")
+    if not rid:
+        task_context.mark_cancelled(ctx_id)
+        return "当前没有进行中的任务，已回到空闲。"
+    try:
+        c = commands.get_command(conn, rid, with_events=False)
+    except commands.CommandError:
+        task_context.mark_cancelled(ctx_id, rid)
+        return "之前关联的采集指令已不存在，已回到空闲。"
+    st = c.get("state")
+    if st == "pending":
+        try:
+            commands.cancel(conn, rid, actor="voice")
+        except commands.CommandError:
+            pass        # 与设备领取竞态，按已领取处理
+        else:
+            task_context.mark_cancelled(ctx_id, rid)
+            return "已撤销采集指令 %s，不会再有结果播报。" % rid
+    if st in ("claimed", "running"):
+        task_context.mark_cancelled(ctx_id, rid)
+        return "设备已在执行采集，无法中途撤销；已停止关注该任务，迟到结果不会播报。"
+    # 终态：本来就是结束的，把时序账结掉再回空闲
+    t_terminal = c.get("t_finished_ms") or commands.now_ms()
+    task_context.observe_terminal(ctx_id, rid, t_terminal)
+    task_context.mark_cancelled(ctx_id, rid)
+    return "该任务已经结束（%s），无需取消，已回到空闲。" % (c.get("state_text") or st)
+
+
+def _execute(conn, text, intent, devices, ctx, t0):
+    """按意图分支执行，返回 (intent, answer, command, error_code)。
+
+    ctx 为 None 时与第 4/5 周行为完全一致（无会话上下文）。
+    """
+    ctx_id = ctx["context_id"] if ctx else None
     action = intent["action"]
+
+    if action == "cancel":
+        if ctx_id is None:
+            return intent, "当前没有会话上下文，无任务可取消。", None, None
+        ans = _cancel_answer(conn, ctx)
+        task_context.log_event(ctx_id, "cancel_intent")
+        return intent, ans, None, None
 
     if action == "clarify":
         answer = intent["reason"]
-    elif action == "refuse":
-        answer = intent["reason"]
-    elif action == "status":
-        answer = status_answer(conn)
-    elif action == "query":
-        answer = query_answer(conn, intent)
-    elif action == "collect":
-        out = collect_answer(conn, text, intent)
-        return out
-    else:
-        answer = "无法理解这条请求，请换种说法。"
+        if ctx_id is not None and "多台" in answer:
+            # 澄清是"哪台设备"，挂起的必须是可执行的采集意图（device 待补），
+            # 不是本轮这个 clarify 意图本身。
+            pending_intent = {"action": "collect", "device_mac": None,
+                              "params": intent.get("params", {}),
+                              "reason": intent["reason"]}
+            task_context.set_pending(ctx_id, "pick_device", 2, intent["reason"],
+                                     pending_intent)
+            task_context.log_event(ctx_id, "clarify_asked")
+        return intent, answer, None, None
 
-    return {"intent": intent, "answer": answer, "command": None, "error_code": None}
+    if action == "refuse":
+        return intent, intent["reason"], None, None
+
+    if action == "status":
+        return intent, status_answer(conn), None, None
+
+    if action == "query":
+        return intent, query_answer(conn, intent), None, None
+
+    if action == "collect":
+        out = collect_answer(conn, text, intent)
+        if ctx_id is not None and out.get("command"):
+            rid = out["command"]["request_id"]
+            task_context.set_active(ctx_id, rid, "capture",
+                                    out["command"].get("t_created_ms") or t0)
+            task_context.log_event(ctx_id, "collect_issued", rid)
+        return intent, out["answer"], out["command"], out["error_code"]
+
+    return intent, "无法理解这条请求，请换种说法。", None, None
+
+
+def _answer(conn, ctx, text, devices, t0):
+    """先看有没有挂起的澄清；有则优先解决它对得上号的输入，否则正常解析。"""
+    if ctx is not None:
+        pending = ctx.get("pending")
+        if pending and pending["kind"] == "pick_device":
+            resolved = _resolve_pick_device(text, pending["intent"], devices)
+            if resolved is None:
+                kw = _keyword_action(text)
+                if kw in ("collect", "query", "cancel"):
+                    # 用户在澄清中途改主意 / 换任务 / 喊停：新意图优先，
+                    # 挂起的澄清直接作废（防止旧问题的答案覆盖新任务）。
+                    task_context.clear_pending(ctx["context_id"])
+                    task_context.log_event(ctx["context_id"], "clarify_abandoned",
+                                           detail=kw)
+                    intent = parse_intent(text, devices)
+                    return _execute(conn, text, intent, devices, ctx, t0)
+                rounds = pending["rounds_left"] - 1
+                if rounds <= 0:
+                    task_context.clear_pending(ctx["context_id"])
+                    task_context.log_event(ctx["context_id"], "clarify_exhausted")
+                    return ({"action": "clarify", "device_mac": None, "params": {},
+                             "reason": "澄清次数用完"},
+                            pending["question"] + " 算了，请重新完整说一遍："
+                            "要重新采集就说“重新采集”，要查看数据就说“查看数据”。",
+                            None, None)
+                task_context.set_pending(ctx["context_id"], "pick_device", rounds,
+                                         pending["question"], pending["intent"])
+                task_context.log_event(ctx["context_id"], "clarify_again",
+                                       detail="rounds_left=%d" % rounds)
+                return (pending["intent"],
+                        "再确认一次：" + pending["question"]
+                        + "（还能再答 %d 次）" % rounds, None, None)
+            task_context.clear_pending(ctx["context_id"])
+            task_context.log_event(ctx["context_id"], "clarify_resolved",
+                                   detail=resolved["device_mac"])
+            return _execute(conn, text, resolved, devices, ctx, t0)
+    intent = parse_intent(text, devices)
+    return _execute(conn, text, intent, devices, ctx, t0)
+
+
+def chat(conn, text, context_id=None):
+    """一次自然语言对话。返回 {intent, answer, command, error_code[, context]}。
+
+    提供 context_id 时启用第 6 周会话上下文：有限多轮澄清、取消、迟到结果
+    隔离（epoch）、request_id 关联日志与计时都挂在会话上；context 视图随响应返回。
+    只有 action == collect 或 cancel（都会改变设备行为/状态）需要 CONTROL_TOKEN，
+    由 app 层在拿到 result 后按其 intent.action 校验。
+    """
+    devices = known_devices(conn)
+    t0 = commands.now_ms()
+    ctx = task_context.get(context_id, create=True) if context_id else None
+    if ctx is not None:
+        task_context.touch(ctx["context_id"])
+        _observe_active_terminal(conn, ctx)
+        task_context.log_event(ctx["context_id"], "chat_in",
+                               request_id=None, detail=text[:60])
+        if not task_context.push_turn(ctx["context_id"], "user", text):
+            task_context.drop(ctx["context_id"])
+            return {"intent": {"action": "refuse", "device_mac": None,
+                               "params": {}, "reason": "轮次超限"},
+                    "answer": "这次对话的轮数已到上限，请重新发起（会清空本轮上下文）。",
+                    "command": None, "error_code": None}
+
+    intent, answer, command, error_code = _answer(conn, ctx, text, devices, t0)
+
+    if ctx is not None:
+        ttff = commands.now_ms() - t0
+        task_context.set_first_feedback(ctx["context_id"], t0, ttff)
+        task_context.log_event(ctx["context_id"], "chat_out", detail="ttff_ms=%d" % ttff)
+        ctx_view = task_context.public_view(ctx["context_id"])
+        out = {"intent": intent, "answer": answer, "command": command,
+               "error_code": error_code, "context": ctx_view}
+    else:
+        out = {"intent": intent, "answer": answer, "command": command,
+               "error_code": error_code}
+    return out

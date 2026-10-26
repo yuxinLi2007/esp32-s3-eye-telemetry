@@ -20,6 +20,7 @@ from pydantic import BaseModel, Field
 import assistant
 import commands
 import db
+import task_context
 import voice
 
 DB_PATH = os.environ.get(
@@ -449,13 +450,21 @@ def command_result(request_id: str, payload: CommandResultIn, conn=Depends(get_c
 
 class ChatIn(BaseModel):
     text: str = Field(min_length=1, max_length=500)
+    # 第6周：会话上下文 id（页面自持一个 UUID hex）。缺省 = 无上下文（等于第 4/5 周行为）。
+    context_id: str | None = Field(default=None, max_length=40)
 
 
 @app.post("/api/v1/assistant/chat")
 def assistant_chat(payload: ChatIn, request: Request, conn=Depends(get_conn)):
-    result = assistant.chat(conn, payload.text)
-    if result["intent"]["action"] == "collect":
-        # 会改变设备行为的操作，和采集开关、指令下发同级鉴权。
+    if payload.context_id and not task_context.CONTEXT_ID_RE.match(payload.context_id):
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "bad_context_id",
+                    "message": "context_id 格式非法"},
+        )
+    result = assistant.chat(conn, payload.text, context_id=payload.context_id)
+    # collect（改设备行为）与 cancel（改指令状态）都是会改变状态的，同级别鉴权。
+    if result["intent"]["action"] in ("collect", "cancel"):
         require_control_token(request)
     return {
         "ok": True,
@@ -464,6 +473,7 @@ def assistant_chat(payload: ChatIn, request: Request, conn=Depends(get_conn)):
         "answer": result["answer"],
         "command": result["command"],
         "error_code": result.get("error_code"),
+        "context": result.get("context"),
     }
 
 
@@ -498,6 +508,31 @@ def voice_speak(payload: SpeakIn):
     """文本 -> 合成音频字节流（TTS）。合成失败时返回 4xx/5xx + error.code。"""
     data, media = voice.speak(payload.text)
     return Response(content=data, media_type=media)
+
+
+@app.get("/api/v1/voice/context")
+def voice_context(context_id: str, conn=Depends(get_conn)):
+    """第6周：会话上下文视图（澄清挂起项 / 取消标记 / request_id 关联日志 / 计时）。
+
+    只暴露"这个会话自己产生"的状态（context_id 是不可猜的随机串），
+    只读不改；顺手把挂着的采集指令的终态时序账结掉（与 status 相同的懒结算思路）。
+    """
+    ctx = task_context.get(context_id)
+    if ctx is None:
+        raise HTTPException(status_code=404,
+                            detail={"code": "context_not_found",
+                                    "message": "会话不存在或已过期"})
+    act = ctx.get("active")
+    if act:
+        try:
+            c = commands.get_command(conn, act["request_id"], with_events=False)
+            if c["state"] in commands.TERMINAL:
+                t_terminal = c.get("t_finished_ms") or commands.now_ms()
+                task_context.observe_terminal(context_id, act["request_id"],
+                                              t_terminal)
+        except commands.CommandError:
+            pass
+    return {"ok": True, "context": task_context.public_view(context_id)}
 
 
 # 界面挂在最后：Starlette 按注册顺序匹配，先注册的 /api 与 /health 不会被它抢走。

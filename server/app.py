@@ -17,8 +17,11 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+import assistant
 import commands
 import db
+import task_context
+import voice
 
 DB_PATH = os.environ.get(
     "TELEMETRY_DB", str(Path(__file__).parent / "data" / "telemetry.db")
@@ -294,6 +297,15 @@ async def command_error_handler(_request: Request, exc: commands.CommandError):
     )
 
 
+@app.exception_handler(voice.VoiceError)
+async def voice_error_handler(_request: Request, exc: voice.VoiceError):
+    """语音链路（第5周）的错误出口，口径同上：code + message 一起返回。"""
+    return JSONResponse(
+        status_code=exc.http_status,
+        content={"ok": False, "error": {"code": exc.code, "message": exc.message}},
+    )
+
+
 class CommandCreate(BaseModel):
     device_mac: str
     op: str
@@ -427,6 +439,100 @@ def command_result(request_id: str, payload: CommandResultIn, conn=Depends(get_c
         "command": commands.to_dict(row, commands.now_ms(),
                                     commands.events_of(conn, request_id)),
     }
+
+
+# ============================================================ 第4周：自然语言入口
+#
+# 查询与请求采集分离：query 只读已有记录；collect 走 commands.create（改设备行为），
+# 因此 collect 才需要 CONTROL_TOKEN，query 不需要。判断在服务端做，
+# 前端没有任何"猜意图"的代码，也就没有"前端猜错了"的可能。
+
+
+class ChatIn(BaseModel):
+    text: str = Field(min_length=1, max_length=500)
+    # 第6周：会话上下文 id（页面自持一个 UUID hex）。缺省 = 无上下文（等于第 4/5 周行为）。
+    context_id: str | None = Field(default=None, max_length=40)
+
+
+@app.post("/api/v1/assistant/chat")
+def assistant_chat(payload: ChatIn, request: Request, conn=Depends(get_conn)):
+    if payload.context_id and not task_context.CONTEXT_ID_RE.match(payload.context_id):
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "bad_context_id",
+                    "message": "context_id 格式非法"},
+        )
+    result = assistant.chat(conn, payload.text, context_id=payload.context_id)
+    # collect（改设备行为）与 cancel（改指令状态）都是会改变状态的，同级别鉴权。
+    if result["intent"]["action"] in ("collect", "cancel"):
+        require_control_token(request)
+    return {
+        "ok": True,
+        "server_time_ms": int(time.time() * 1000),
+        "intent": result["intent"],
+        "answer": result["answer"],
+        "command": result["command"],
+        "error_code": result.get("error_code"),
+        "context": result.get("context"),
+    }
+
+
+# ============================================================ 第5周：语音链路
+#
+# 转写 / 合成都是"只读"操作（不改变设备行为），鉴权口径与第 4 周"查询"一致（匿名）：
+# 语音服务的密钥只存在服务端环境变量（VOICE_*），前端和设备的请求里从不携带密钥。
+# 未配置 / 超时 / 无语音 / 服务报错统一走 voice.VoiceError 出口（带错误码），
+# 不做任何"假装成功"。
+
+
+class SpeakIn(BaseModel):
+    text: str = Field(min_length=1, max_length=500)
+
+
+@app.get("/api/v1/voice/info")
+def voice_info():
+    """运行位置与配置状态：界面据此如实标注音频来源（电脑音频 vs 设备音频）。"""
+    return voice.info()
+
+
+@app.post("/api/v1/voice/transcribe")
+async def voice_transcribe(request: Request):
+    """音频 -> 文本（ASR）。失败时返回 4xx/5xx + error.code，绝无假文本。"""
+    audio = await request.body()
+    text = voice.transcribe(audio, request.headers.get("content-type"))
+    return {"ok": True, "text": text}
+
+
+@app.post("/api/v1/voice/speak")
+def voice_speak(payload: SpeakIn):
+    """文本 -> 合成音频字节流（TTS）。合成失败时返回 4xx/5xx + error.code。"""
+    data, media = voice.speak(payload.text)
+    return Response(content=data, media_type=media)
+
+
+@app.get("/api/v1/voice/context")
+def voice_context(context_id: str, conn=Depends(get_conn)):
+    """第6周：会话上下文视图（澄清挂起项 / 取消标记 / request_id 关联日志 / 计时）。
+
+    只暴露"这个会话自己产生"的状态（context_id 是不可猜的随机串），
+    只读不改；顺手把挂着的采集指令的终态时序账结掉（与 status 相同的懒结算思路）。
+    """
+    ctx = task_context.get(context_id)
+    if ctx is None:
+        raise HTTPException(status_code=404,
+                            detail={"code": "context_not_found",
+                                    "message": "会话不存在或已过期"})
+    act = ctx.get("active")
+    if act:
+        try:
+            c = commands.get_command(conn, act["request_id"], with_events=False)
+            if c["state"] in commands.TERMINAL:
+                t_terminal = c.get("t_finished_ms") or commands.now_ms()
+                task_context.observe_terminal(context_id, act["request_id"],
+                                              t_terminal)
+        except commands.CommandError:
+            pass
+    return {"ok": True, "context": task_context.public_view(context_id)}
 
 
 # 界面挂在最后：Starlette 按注册顺序匹配，先注册的 /api 与 /health 不会被它抢走。

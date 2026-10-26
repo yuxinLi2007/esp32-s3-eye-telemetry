@@ -6,209 +6,150 @@
 <title>ESP32-S3-EYE 遥测</title>
 <style>
   :root {
-    --bg:#0e1116; --panel:#161b22; --line:#2a3038; --fg:#e6edf3; --dim:#8b949e;
-    --ok:#2ea043; --warn:#d29922; --crit:#da3633; --info:#388bfd;
+    --bg:#fafafa; --fg:#111; --dim:#666; --crit:#d93025;
+    --line:#ddd; --grid:#e5e5e5;
   }
   * { box-sizing:border-box; }
   body { margin:0; background:var(--bg); color:var(--fg);
          font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
-  h3 { margin:0 0 8px; font-size:13px; font-weight:600; color:var(--dim);
-       text-transform:uppercase; letter-spacing:.06em; }
-  .wrap { max-width:1400px; margin:0 auto; padding:0 16px 48px; }
+  .wrap { max-width:1200px; margin:0 auto; padding:12px 16px 48px; }
 
-  /* 报警条：整页最显眼的位置，状态不能靠用户自己从图表里猜 */
-  #alarm { padding:14px 16px; font-size:15px; font-weight:600; display:flex;
-           gap:12px; align-items:baseline; border-bottom:1px solid var(--line); }
+  /* 报警条：仅异常时出现（正常 / 主动停止时隐藏） */
+  #alarm { display:flex; gap:10px; align-items:baseline; padding:10px 14px;
+           font-size:14px; font-weight:600; }
   #alarm .sub { font-size:12px; font-weight:400; opacity:.85; }
-  .a-ok   { background:#0d2a17; color:#7ee787; }
-  .a-warn { background:#3a2d08; color:#f0c674; }
-  .a-crit { background:#4a1512; color:#ff9d97; }
-  /* 主动停止不是故障。用中性蓝而不是绿：绿色会被读成"一切正常"，
-     但此刻数据确实是断的，只是原因已知。 */
-  .a-info { background:#0d2137; color:#79c0ff; }
+  .a-crit { background:#fbdad7; color:#b31412; }
+  .a-warn { background:#fdece6; color:#a63b00; }
+  .a-info, .a-ok { background:#ececec; color:#555; }
 
   .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr));
-           gap:10px; margin:16px 0; }
-  .card { background:var(--panel); border:1px solid var(--line); border-radius:8px;
-          padding:10px 12px; }
+           gap:10px; margin:12px 0; }
+  .card { background:#fff; padding:10px 12px; }
   .card .k { font-size:11px; color:var(--dim); }
   .card .v { font-size:20px; font-weight:600; margin-top:2px; }
-  .card .u { font-size:11px; color:var(--dim); font-weight:400; margin-left:2px; }
   .card.bad .v { color:var(--crit); }
-  .card.warn .v { color:var(--warn); }
 
-  section { margin:20px 0; }
-  .chartbox { position:relative; background:var(--panel); border:1px solid var(--line);
-              border-radius:8px; padding:10px 12px 6px; margin-bottom:12px; }
+  .chartbox { margin:12px 0; }
   canvas { width:100%; display:block; cursor:crosshair; }
 
-  .prov { background:var(--panel); border:1px solid var(--line); border-radius:8px;
-          padding:12px; }
-  .kv { display:grid; grid-template-columns:auto 1fr; gap:4px 14px; font-size:12px; }
-  .kv .k { color:var(--dim); }
-  .kv .v { word-break:break-all; }
-
-  .tablewrap { max-height:340px; overflow:auto; border:1px solid var(--line);
-               border-radius:8px; background:var(--panel); }
-  table { border-collapse:collapse; width:100%; font-size:12px; }
-  th,td { padding:5px 10px; text-align:right; white-space:nowrap;
-          border-bottom:1px solid var(--line); }
-  th { position:sticky; top:0; background:#1c2229; color:var(--dim); font-weight:600;
-       text-align:right; z-index:1; }
-  td.l,th.l { text-align:left; }
-  tr.peer td { background:#14181d; }  /* 不同批次隔行，来源边界可见 */
-
-  .badge { display:inline-block; padding:1px 6px; border-radius:10px; font-size:11px;
-           line-height:16px; }
-  .b-ntp_fresh   { background:#0d2a17; color:#7ee787; }
-  .b-ntp_stale   { background:#3a2d08; color:#f0c674; }
-  .b-ntp_expired { background:#3d2408; color:#ffa657; }
-  .b-unsynced    { background:#4a1512; color:#ff9d97; }
-
-  .controls { display:flex; gap:10px; align-items:center; margin:16px 0 0;
-              color:var(--dim); font-size:12px; flex-wrap:wrap; }
-  select { background:var(--panel); color:var(--fg); border:1px solid var(--line);
-           border-radius:6px; padding:4px 8px; font:inherit; }
-  .btn { background:var(--panel); color:var(--fg); border:1px solid var(--line);
+  .ctlrow, .nl, .cmdrow { display:flex; gap:8px; align-items:center;
+                          margin:12px 0; flex-wrap:wrap; }
+  .btn { background:#fff; color:var(--fg); border:1px solid var(--line);
          border-radius:6px; padding:4px 12px; font:inherit; cursor:pointer; }
   .btn:hover:not(:disabled) { border-color:var(--dim); }
   .btn:disabled { opacity:.35; cursor:default; }
-  .btn.go   { border-color:var(--ok);   color:#7ee787; }
-  .btn.halt { border-color:var(--crit); color:#ff9d97; }
-  #ctl_state { color:var(--fg); }
-  #refreshed { margin-left:auto; }
-  .note { color:var(--dim); font-size:11px; margin-top:6px; }
-  .tip { position:absolute; pointer-events:none; background:#1c2229; border:1px solid var(--line);
-         border-radius:6px; padding:6px 8px; font-size:11px; display:none; z-index:5;
-         white-space:pre; }
+  .btn.halt { color:var(--crit); border-color:var(--crit); }
+  #ctl_state { font-size:12px; color:var(--dim); }
 
-  /* ---- 第2周：远程指令面板 ---- */
-  .cmdrow { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:8px; }
-  .cmdrow label { color:var(--dim); }
-  input[type=text], input[type=number] { background:#0d1116; color:var(--fg);
+  .nl input[type=text] { flex:1; min-width:200px; }
+  #ask_out { flex-basis:100%; font-size:12px; }
+  .ans { margin:2px 0; }
+  .stat { color:var(--dim); }
+
+  /* 第5周：四态色点（录音/识别/执行/播放）+ 运行位置标注 */
+  .vstates { display:inline-flex; gap:5px; align-items:center; margin-left:2px; }
+  .dot { width:9px; height:9px; border-radius:50%; background:#d8d8d8;
+         display:inline-block; }
+  .dot.on { background:var(--crit); animation:pulse 1s ease-in-out infinite; }
+  @keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:.35; } }
+  .origin { font-size:10px; color:var(--dim); margin-left:2px; }
+
+  input[type=text], input[type=number] { background:#fff; color:var(--fg);
       border:1px solid var(--line); border-radius:6px; padding:4px 8px; font:inherit; }
   input[type=text] { width:170px; }
   input[type=number] { width:86px; }
-  .btn.op { border-color:var(--info); color:#79c0ff; }
-  .btn.danger { border-color:var(--crit); color:#ff9d97; }
-  .b-pending   { background:#3a2d08; color:#f0c674; }
-  .b-claimed,
-  .b-running   { background:#0d2137; color:#79c0ff; }
-  .b-done      { background:#0d2a17; color:#7ee787; }
-  .b-failed,
-  .b-timeout   { background:#4a1512; color:#ff9d97; }
-  .b-expired   { background:#3d2408; color:#ffa657; }
-  .b-cancelled { background:#21262d; color:#8b949e; }
-  .bar { position:relative; height:6px; width:70px; background:#21262d;
+
+  .badge { display:inline-block; padding:1px 6px; border-radius:4px;
+           font-size:11px; line-height:16px; background:#efefef; color:#333; }
+  .b-pending, .b-claimed { background:#fdece6; color:#a63b00; }
+  .b-running, .b-claimed-2 { background:#efefef; color:#333; }
+  .b-failed, .b-timeout { background:#fbdad7; color:#b31412; }
+  .b-expired { background:#fdece6; color:#a63b00; }
+  .b-ntp_stale, .b-ntp_expired, .b-unsynced { background:#fbdad7; color:#b31412; }
+  .b-ntp_fresh { background:#efefef; color:#333; }
+
+  .tablewrap { max-height:340px; overflow:auto; }
+  table { border-collapse:collapse; width:100%; font-size:12px; }
+  th,td { padding:5px 10px; text-align:right; white-space:nowrap; }
+  th { position:sticky; top:0; background:#f0f0f0; color:var(--dim);
+       font-weight:600; text-align:right; z-index:1; }
+  td.l,th.l { text-align:left; }
+  tr:nth-child(even) td { background:#f4f4f4; }
+  td.mismatch { color:var(--crit); font-weight:600; }
+
+  .bar { position:relative; height:6px; width:70px; background:#e0e0e0;
          border-radius:3px; overflow:hidden; }
-  .bar > i { display:block; height:100%; background:var(--info); }
-  .cmd-detail { background:var(--panel); border:1px solid var(--line); border-radius:8px;
-                padding:12px; margin-top:12px; }
-  .cmd-detail h3 { margin:14px 0 6px; }
+  .bar > i { display:block; height:100%; background:#666; }
+  .cmd-detail { margin-top:12px; }
+  .kv { display:grid; grid-template-columns:auto 1fr; gap:4px 14px; font-size:12px; }
+  .kv .k { color:var(--dim); }
+  .kv .v { word-break:break-all; }
   .tl { list-style:none; margin:0; padding:0; font-size:11px; color:var(--dim); }
-  .tl li { padding:3px 0; border-bottom:1px dotted #21262d; }
-  .tl b { color:var(--fg); font-weight:600; }
-  pre.json { margin:0; padding:8px; background:#0d1116; border:1px solid var(--line);
-             border-radius:6px; overflow:auto; max-height:240px; font-size:11px; }
-  td.mismatch { color:var(--warn); font-weight:600; }
+  .tl li { padding:3px 0; }
+  pre.json { margin:0; padding:8px; background:#f0f0f0; border-radius:6px;
+             overflow:auto; max-height:240px; font-size:11px; }
+  .prov { }
 </style>
 </head>
 <body>
-<div id="alarm" class="a-crit">正在连接服务端 …</div>
+<div id="alarm" class="a-crit" style="display:none">
+  <span>正在连接服务端…</span><span class="sub"></span>
+</div>
 
 <div class="wrap">
-  <div class="controls">
-    <span>窗口</span>
-    <select id="limit">
-      <option value="1000">最近 1000 个样本（约 1 分钟）</option>
-      <option value="3000" selected>最近 3000 个样本（约 3 分钟）</option>
-      <option value="10000">最近 10000 个样本（约 10 分钟）</option>
-    </select>
-    <button class="btn go"   id="btn_start">开始采集</button>
-    <button class="btn halt" id="btn_stop">停止采集</button>
-    <span id="ctl_state"></span>
-    <span id="refreshed"></span>
-  </div>
-
   <section class="cards" id="cards"></section>
 
-  <section>
-    <h3>数据来源（最近一批）</h3>
-    <div class="prov" id="prov"></div>
+  <section class="chartbox">
+    <canvas id="c_acc"></canvas>
+  </section>
+
+  <section class="ctlrow">
+    <button class="btn" id="btn_start">开始采集</button>
+    <button class="btn halt" id="btn_stop">停止采集</button>
+    <span id="ctl_state"></span>
+  </section>
+
+  <section class="nl">
+    <input type="text" id="ask_in" spellcheck="false" maxlength="500"
+           placeholder="自然语言：查看数据 / 重新采集">
+    <button class="btn" id="ask_btn">发送</button>
+    <button class="btn" id="ptt_btn" title="按下开始录音，再按停止">按讲</button>
+    <button class="btn halt" id="vt_stop" title="停止当前任务：停播报、撤销/停止关注、回空闲"
+            style="display:none">停止</button>
+    <span class="vstates" title="录音中 · 识别中 · 执行中 · 播放中">
+      <i class="dot" id="st_rec"></i><i class="dot" id="st_asr"></i>
+      <i class="dot" id="st_run"></i><i class="dot" id="st_play"></i>
+      <span class="origin" id="voice_origin">电脑音频·浏览器</span>
+    </span>
+    <div id="ask_out"></div>
   </section>
 
   <section>
-    <h3>远程采集指令（第2周）</h3>
-    <div class="prov">
-      <div class="cmdrow">
-        <label>目标设备 MAC</label>
-        <input type="text" id="cmd_mac" spellcheck="false" placeholder="AA:BB:CC:DD:EE:FF">
-        <span class="note" id="cmd_mac_hint"></span>
-        <label>备注</label>
-        <input type="text" id="cmd_note_text" style="width:220px" maxlength="200"
-               placeholder="选填，会显示在指令详情里">
-      </div>
-      <!-- 按钮与参数输入框由 commands.js 按 /api/v1/commands/ops 渲染：
-           参数范围只有服务端一份，前端不另抄，改一边忘一边是迟早的事 -->
-      <div class="cmdrow" id="cmd_ops"></div>
-      <div class="cmdrow">
-        <span class="note" id="cmd_stats"></span>
-        <button class="btn" id="cmd_refresh">立即刷新</button>
-      </div>
-      <div class="note" id="cmd_note"></div>
+    <div class="cmdrow">
+      <label>目标设备 MAC</label>
+      <input type="text" id="cmd_mac" spellcheck="false" placeholder="AA:BB:CC:DD:EE:FF">
+      <label>备注</label>
+      <input type="text" id="cmd_note_text" style="width:200px" maxlength="200"
+             placeholder="可选">
     </div>
-    <div class="tablewrap" style="margin-top:10px">
+    <div class="cmdrow" id="cmd_ops"></div>
+    <div class="cmdrow">
+      <span id="cmd_stats"></span>
+      <button class="btn" id="cmd_refresh">刷新</button>
+    </div>
+    <div id="cmd_note"></div>
+    <div class="tablewrap">
       <table>
         <thead><tr>
           <th class="l">request_id</th><th class="l">指令</th><th class="l">状态</th>
           <th class="l">进度</th><th>耗时</th><th>样本 服务端/设备</th>
-          <th class="l">结果 / 失败原因</th><th class="l">操作</th>
+          <th class="l">结果</th><th class="l">操作</th>
         </tr></thead>
         <tbody id="cmd_tbody"></tbody>
       </table>
     </div>
     <div id="cmd_detail"></div>
-    <div class="note">
-      指令采集到的样本不会混进上面的连续流图表：服务端按 request_id 把两条流分开存、
-      分开算缺口。要看某条指令采到了什么，点它的「详情」。
-      超时不靠后台线程判：页面每 2 秒轮询一次，服务端在被读到的那一刻结算。
-    </div>
-  </section>
-
-  <section>
-    <h3>加速度合矢量 |a|（g）</h3>
-    <div class="chartbox">
-      <canvas id="c_acc"></canvas>
-      <div class="tip" id="tip_acc"></div>
-    </div>
-  </section>
-
-  <section>
-    <h3>声压级 SPL（dB）</h3>
-    <div class="chartbox">
-      <canvas id="c_spl"></canvas>
-      <div class="tip" id="tip_spl"></div>
-    </div>
-  </section>
-  <div class="note">
-    横轴为时间：以「服务端接收该批数据的时刻」为锚点，批内按设备单调时钟排布。
-    不采信设备的绝对时间，因此设备时钟即使错得很远也不会把曲线画歪。
-    红色竖带 = 该区间内确定有样本丢失或设备重启。
-  </div>
-
-  <section>
-    <h3>样本明细</h3>
-    <div class="tablewrap">
-      <table>
-        <thead><tr>
-          <th class="l">seq</th><th class="l">boot</th>
-          <th>设备时间</th><th>服务端接收</th>
-          <th>ax</th><th>ay</th><th>az</th><th>|a|</th><th>SPL</th>
-          <th class="l">时间戳可信度</th><th class="l">来源 IP</th>
-        </tr></thead>
-        <tbody id="tbody"></tbody>
-      </table>
-    </div>
+    <div class="prov" id="prov"></div>
   </section>
 </div>
 
@@ -221,34 +162,26 @@ const NTP_FRESH_S = 300, NTP_STALE_S = 3600;
 const ONLINE_MS  = UPLOAD_INTERVAL_MS * 3;   // 6s  正常上传节奏允许的范围
 const OFFLINE_MS = UPLOAD_INTERVAL_MS * 7;   // 14s 连续 7 次没上传即判失联
 
-const COL = { ok:'#2ea043', warn:'#d29922', crit:'#da3633', info:'#388bfd',
-              fg:'#e6edf3', dim:'#8b949e', grid:'#2a3038' };
+const COL = { crit:'#d93025', fg:'#111', dim:'#666', grid:'#e5e5e5' };
 
 const $ = id => document.getElementById(id);
 
-// 用 file:// 直接双击打开时，相对路径会被解析成 file:///api/v1/...，永远拿不到数据。
-// 所以那种情况下必须换成服务端的绝对地址。服务端本身已经在跑——数据存在它的
-// SQLite 里，光有 HTML 文件无论如何都变不出数据来。
-//   优先 ?api=http://host:8000（顺便记住）→ 上次记住的 → 本机默认
 const API = (() => {
   const q = new URLSearchParams(location.search).get('api');
   if (q) { try { localStorage.setItem('api_base', q); } catch (e) {} }
-  if (location.protocol !== 'file:') return '';   // 由服务端提供时走同源相对路径
+  if (location.protocol !== 'file:') return '';
   let saved = q || null;
   if (!saved) { try { saved = localStorage.getItem('api_base'); } catch (e) {} }
   return (saved || 'http://127.0.0.1:8000').replace(/\/+$/, '');
 })();
 const api = p => API + p;
 
-// 服务端设了 CONTROL_TOKEN 才用得上。网页里不可能预置密钥——HTML 本身是要发出去的，
-// 所以首次 401 时现问一次再记住。
 let ctlToken = null;
 try { ctlToken = localStorage.getItem('ctl_token'); } catch (e) {}
 const ctlHeaders = () =>
   Object.assign({ 'Content-Type': 'application/json' },
                 ctlToken ? { 'X-Control-Token': ctlToken } : {});
 
-// 与服务端 db.trust_level 同规则。设备端时间只有在 NTP 同步过且足够新鲜时才可参考。
 function trustOf(synced, age) {
   if (!synced || age === null || age === undefined) return 'unsynced';
   if (age <= NTP_FRESH_S) return 'ntp_fresh';
@@ -267,9 +200,6 @@ const fmtTime = ms => ms === null || ms === undefined ? '—'
     + String(ms % 1000).padStart(3, '0');
 const fmtAge = ms => ms < 1000 ? ms + ' ms' : (ms / 1000).toFixed(1) + ' s';
 
-// 把控制历史配对成"停止 → 恢复"的区间（服务端时间）。
-// 这是 control_log 存在的唯一理由：一段空白到底是用户按了停止，还是设备坏了，
-// 光看图分不出来，只能靠这里给出的时间区间去对。
 function stopIntervals(history, now) {
   const out = [];
   let open = null;
@@ -277,13 +207,10 @@ function stopIntervals(history, now) {
     if (!h.collect && open === null) open = h.t_server_ms;
     else if (h.collect && open !== null) { out.push([open, h.t_server_ms]); open = null; }
   }
-  if (open !== null) out.push([open, now]);   // 仍未恢复
+  if (open !== null) out.push([open, now]);
   return out;
 }
 
-// 把逐条样本整理成可绘制序列。
-// x = 批次的服务端接收时刻 + 批内设备时钟偏移（偏移 <= 0），
-// 于是每条样本都锚在权威时间上，设备绝对时钟不参与。
 function buildSeries(rows, stops) {
   const byBatch = new Map();
   for (const r of rows) {
@@ -300,19 +227,11 @@ function buildSeries(rows, stops) {
     for (const r of b.rows) {
       const mag = (r.ax === null || r.ay === null || r.az === null)
         ? null : Math.hypot(r.ax, r.ay, r.az);
-      pts.push({
-        x: b.recv + (r.t_device_ms - b.maxDev),
-        mag, spl: r.spl_db, raw: r,
-        trust: trustOf(r.ntp_synced, r.ntp_sync_age_s),
-      });
+      pts.push({ x: b.recv + (r.t_device_ms - b.maxDev), mag, raw: r });
     }
   }
   pts.sort((a, z) => a.x - z.x);
 
-  // 切段：只有"确定不连续"才断开，不靠时间间隔阈值乱猜。
-  //   1) boot_id 变化   -> 设备重启
-  //   2) 同 boot 内 seq 跳号 -> 板上确有丢样
-  //   3) 接收时刻间隔过大 -> 连续多次上传失败
   const segs = [], bands = [];
   let cur = null, prev = null;
   for (const p of pts) {
@@ -320,13 +239,10 @@ function buildSeries(rows, stops) {
     if (prev) {
       const r = p.raw, q = prev.raw;
       if (r.boot_id !== q.boot_id)        reason = '设备重启 ' + q.boot_id + ' → ' + r.boot_id;
-      else if (r.seq > q.seq + 1)         reason = '丢样 ' + (r.seq - q.seq - 1) + ' 个（seq '
-                                                   + q.seq + ' → ' + r.seq + '）';
+      else if (r.seq > q.seq + 1)         reason = '丢样 ' + (r.seq - q.seq - 1) + ' 个';
       else if (p.x - prev.x > UPLOAD_INTERVAL_MS * 3) {
-        // 落在控制历史记录的停止区间里 = 用户主动停的，不算故障，按中性色画。
-        // 不这么分的话，"我按了停止"和"设备挂了"在图上长得一模一样。
         if ((stops || []).some(v => prev.x < v[1] && p.x > v[0])) {
-          reason = '已停止采集 ' + fmtAge(p.x - prev.x); kind = 'stopped';
+          reason = '已停止采集'; kind = 'stopped';
         } else {
           reason = '上传中断 ' + fmtAge(p.x - prev.x);
         }
@@ -343,7 +259,7 @@ function buildSeries(rows, stops) {
   return { pts, segs, bands };
 }
 
-function drawChart(canvas, tip, series, opts) {
+function drawChart(canvas, series, opts) {
   const dpr = window.devicePixelRatio || 1;
   const cssW = canvas.clientWidth || 800;
   const cssH = 170;
@@ -360,38 +276,29 @@ function drawChart(canvas, tip, series, opts) {
   const all = series.pts.filter(p => p[opts.field] !== null && p[opts.field] !== undefined);
   if (!all.length || !series.pts.length) {
     g.fillStyle = COL.dim; g.font = '13px ui-monospace,monospace'; g.textAlign = 'center';
-    g.fillText(series.pts.length ? '该指标无有效数据' : '无数据', cssW / 2, cssH / 2);
-    canvas.onmousemove = null;   // 别留着上一次渲染的旧闭包，否则提示框会对错点
-    canvas.onmouseleave = null;
+    g.fillText('无数据', cssW / 2, cssH / 2);
     return;
   }
 
   const xs = series.pts.map(p => p.x);
   let x0 = Math.min(...xs), x1 = Math.max(...xs);
-  // 把"到现在为止都没有数据"的那段时间也画进来，失联不能被裁掉
   x1 = Math.max(x1, Math.min(series.now, x1 + UPLOAD_INTERVAL_MS * 60));
   if (x1 <= x0) x1 = x0 + 1000;
 
   const vs = all.map(p => p[opts.field]);
-  // 把参考值并进量程，保证 1g 那条线一定在视野里；
-  // 但不用它当地板——否则真实波动被压成一条平线，等于没画。
   if (opts.include) vs.push(...opts.include);
   let lo = Math.min(...vs), hi = Math.max(...vs);
   const pad = (hi - lo) * 0.15 || 0.05;
   lo -= pad; hi += pad;
 
-  // 量程窄的时候固定小数位会把 5 条刻度印成同一个数（1.000 / 1.000 / 1.000），
-  // 纵轴等于没有信息——设备静止时 |a| 的跨度就只有千分之几，这一定会发生。
-  // 按实际刻度间隔决定精度，保证相邻刻度可区分；位数不够时把左侧留白加宽。
   const gstep = (hi - lo) / 4;
-  const dec = Math.min(6, Math.max(opts.decimals,
-    gstep > 0 ? Math.ceil(-Math.log10(gstep)) : opts.decimals));
+  const dec = Math.min(6, Math.max(opts.decimals || 3,
+    gstep > 0 ? Math.ceil(-Math.log10(gstep)) : (opts.decimals || 3)));
   if (dec > 3) { L = 46 + (dec - 3) * 7; pw = cssW - L - R; }
 
   const X = t => L + (t - x0) / (x1 - x0) * pw;
   const Y = v => T + (hi - v) / (hi - lo) * ph;
 
-  // 网格与刻度
   g.font = '10px ui-monospace,monospace';
   g.textAlign = 'right'; g.textBaseline = 'middle';
   for (let i = 0; i <= 4; i++) {
@@ -408,44 +315,30 @@ function drawChart(canvas, tip, series, opts) {
     g.fillText(fmtTime(t).slice(0, 8), X(t), T + ph + 5);
   }
 
-  // 参考线（|a| 的 1 g 是有物理意义的）
-  if (opts.refLine !== undefined && opts.refLine >= lo && opts.refLine <= hi) {
-    g.save(); g.setLineDash([4, 4]); g.strokeStyle = COL.info; g.lineWidth = 1;
-    g.beginPath(); g.moveTo(L, Y(opts.refLine)); g.lineTo(L + pw, Y(opts.refLine)); g.stroke();
-    g.restore();
-  }
-
-  // 丢样/重启/停止竖带 —— 让"这段没有数据"在图上占面积，而不是一条线悄悄连过去。
-  // 红色限于真故障；主动停止用中性灰，否则用户自己按的停止会被当成设备坏了。
+  // 缺口 = 红色竖带；主动停止 = 灰色竖带
   for (const b of series.bands) {
     const held = b.kind === 'stopped';
     const bx0 = Math.max(X(b.x0), L), bx1 = Math.max(X(b.x1), L);
     const w = Math.max(bx1 - bx0, 2);
-    g.fillStyle = held ? 'rgba(139,148,158,.16)' : 'rgba(218,54,51,.22)';
+    g.fillStyle = held ? 'rgba(120,120,120,.15)' : 'rgba(217,48,37,.20)';
     g.fillRect(bx0, T, w, ph);
-    g.strokeStyle = held ? 'rgba(139,148,158,.85)' : 'rgba(218,54,51,.9)';
+    g.strokeStyle = held ? 'rgba(120,120,120,.6)' : 'rgba(217,48,37,.9)';
     g.lineWidth = 1;
     g.beginPath(); g.moveTo(bx0 + w / 2, T); g.lineTo(bx0 + w / 2, T + ph); g.stroke();
   }
 
-  // 数据之后到现在的空白：设备失联时这段必须可见。
-  // 但"已经停采"和"突然没了"必须区分开，否则停止采集会伪装成失联报警。
+  // 最后一点之后到现在的空白：失联必须可见（停止时灰色、故障时红色）
   const lastX = Math.max(...xs);
   if (series.stopped) {
     const bx = Math.max(X(lastX), L);
-    g.fillStyle = 'rgba(139,148,158,.16)';
+    g.fillStyle = 'rgba(120,120,120,.12)';
     g.fillRect(bx, T, L + pw - bx, ph);
-    g.fillStyle = 'rgba(200,205,212,.9)'; g.textAlign = 'left'; g.textBaseline = 'top';
-    g.fillText('已停止采集', bx + 6, T + 6);
   } else if (series.now - lastX > ONLINE_MS) {
     const bx = Math.max(X(lastX), L);
-    g.fillStyle = 'rgba(218,54,51,.12)';
+    g.fillStyle = 'rgba(217,48,37,.10)';
     g.fillRect(bx, T, L + pw - bx, ph);
-    g.fillStyle = 'rgba(255,157,151,.9)'; g.textAlign = 'left'; g.textBaseline = 'top';
-    g.fillText('此后无数据（' + fmtAge(series.now - lastX) + '）', bx + 6, T + 6);
   }
 
-  // 折线：段内连线，段间绝不连
   g.lineWidth = 1.4; g.strokeStyle = opts.color;
   g.lineJoin = 'round'; g.lineCap = 'round';
   for (const s of series.segs) {
@@ -453,30 +346,12 @@ function drawChart(canvas, tip, series, opts) {
     g.beginPath();
     for (const p of s.pts) {
       const v = p[opts.field];
-      if (v === null || v === undefined) { pen = false; continue; }  // null 断开，不当 0
+      if (v === null || v === undefined) { pen = false; continue; }
       const px = X(p.x), py = Y(v);
       if (pen) g.lineTo(px, py); else { g.moveTo(px, py); pen = true; }
     }
     g.stroke();
   }
-
-  canvas._geom = { X, Y, x0, x1, series, opts, L, pw, T, ph, cssW, cssH };
-
-  canvas.onmousemove = ev => {
-    const rect = canvas.getBoundingClientRect();
-    const mx = ev.clientX - rect.left;
-    let best = null, bd = Infinity;
-    for (const p of series.pts) {
-      const d = Math.abs(X(p.x) - mx);
-      if (d < bd) { bd = d; best = p; }
-    }
-    if (!best || bd > 12) { tip.style.display = 'none'; return; }
-    tip.innerHTML = opts.tip(best);
-    tip.style.display = 'block';
-    tip.style.left = Math.min(X(best.x) + 12, cssW - 230) + 'px';
-    tip.style.top = (Y(best[opts.field] ?? lo) - 10) + 'px';
-  };
-  canvas.onmouseleave = () => { tip.style.display = 'none'; };
 }
 
 const el = (tag, cls, txt) => {
@@ -491,137 +366,56 @@ function setAlarm(level, title, sub) {
   a.className = 'a-' + level;
   a.innerHTML = '';
   a.appendChild(el('span', null, title));
-  if (sub) a.appendChild(el('span', 'sub', sub));
+  a.appendChild(el('span', 'sub', sub || ''));
+  // 正常与主动停止不算异常：报警条只在真正有问题时出现
+  a.style.display = (level === 'ok' || level === 'info') ? 'none' : 'flex';
 }
 
-// 最近一次取到的采集开关状态。null = 还没取到。
 let ctl = null;
+
+function sampleRate(series) {
+  const segs = series.segs;
+  if (!segs.length) return null;
+  const seg = segs[segs.length - 1].pts;
+  const dts = [];
+  for (let i = 1; i < seg.length; i++) {
+    const d = seg[i].raw.t_device_ms - seg[i - 1].raw.t_device_ms;
+    if (d > 0 && d < 60000) dts.push(d);
+  }
+  if (!dts.length) return null;
+  dts.sort((a, b) => a - b);
+  return Math.round(1000 / dts[(dts.length / 2) | 0]);
+}
 
 function renderCards(st, rows, series) {
   const cards = $('cards');
   cards.innerHTML = '';
   const last = st.last_batch;
-  const stopped = !!ctl && !ctl.collect;
-  const missing = series.bands.filter(b => b.reason.startsWith('丢样')).length;
-  const missingN = rows.length ? (() => {
-    let n = 0, prev = null;
-    for (const r of rows) {
-      if (prev && prev.boot_id === r.boot_id && r.seq > prev.seq + 1) n += r.seq - prev.seq - 1;
-      prev = r;
-    }
-    return n;
-  })() : 0;
-
-  // 停止采集后设备本就该安静。旧数据停在那里不是"失联"，
-  // 但也不能就此说"一切正常"——状态卡要如实说"已停止"。
-  const devState = !last ? '无数据'
-    : stopped ? (last.age_ms > ONLINE_MS ? '已停止采集' : '收尾中')
-    : last.age_ms > OFFLINE_MS ? '失联'
-    : last.age_ms > ONLINE_MS ? '延迟' : '在线';
-
+  const rate = last ? sampleRate(series) : null;
   const defs = [
-    { k:'设备状态', v: devState,
-      cls: !last ? 'bad' : stopped ? ''
-                  : last.age_ms > OFFLINE_MS ? 'bad'
-                  : last.age_ms > ONLINE_MS ? 'warn' : '' },
-    // 停止采集时设备本来就该安静，这个数字照报但不着色。
-    // 标红会和上方"已停止采集"的蓝色提示自相矛盾——同一屏两个相反结论。
-    { k:'最近一批距今', v: last ? fmtAge(last.age_ms) : '—',
-      cls: stopped ? '' : last && last.age_ms > OFFLINE_MS ? 'bad'
-                       : last && last.age_ms > ONLINE_MS ? 'warn' : '' },
-    { k:'窗口内样本', v: rows.length },
-    { k:'窗口内缺口', v: missing + ' 处', u: missingN ? '共丢 ' + missingN + ' 个' : '',
-      cls: missingN ? 'warn' : '' },
-    { k:'板上累计丢弃', v: st.total_dropped, cls: st.total_dropped ? 'warn' : '' },
-    { k:'累计样本', v: st.total_readings },
-    { k:'重启次数', v: st.total_boots, cls: st.total_boots > 1 ? 'warn' : '' },
-    { k:'设备时钟偏差', v: last && last.device_clock_skew_ms !== null
-                              ? (last.device_clock_skew_ms / 1000).toFixed(2) : '—', u:'s' },
+    { k: '最后接收时间',
+      v: last ? fmtTime(last.t_server_recv_ms) : '—',
+      cls: last && last.age_ms > OFFLINE_MS ? 'bad' : '' },
+    { k: '采样率',
+      v: rate ? rate + ' Hz' : '—',
+      cls: '' },
+    { k: 'NTP 可信等级',
+      v: last ? (TRUST_TEXT[last.t_trust] || last.t_trust) : '—',
+      cls: last && last.t_trust !== 'ntp_fresh' ? 'bad' : '' },
   ];
   for (const d of defs) {
     const c = el('div', 'card ' + (d.cls || ''));
     c.appendChild(el('div', 'k', d.k));
-    const v = el('div', 'v');
-    v.appendChild(document.createTextNode(d.v));
-    if (d.u) v.appendChild(el('span', 'u', d.u));
-    c.appendChild(v);
+    c.appendChild(el('div', 'v', d.v));
     cards.appendChild(c);
   }
 }
 
-function renderProv(st, rows) {
-  const p = $('prov');
-  p.innerHTML = '';
-  const last = st.last_batch;
-  if (!last) { p.appendChild(el('div', 'note', '尚无任何批次入库。')); return; }
-  const kv = el('div', 'kv');
-  const add = (k, v, cls) => {
-    kv.appendChild(el('div', 'k', k));
-    const d = el('div', 'v');
-    if (cls) { const s = el('span', 'badge ' + cls, v); d.appendChild(s); }
-    else d.textContent = v;
-    kv.appendChild(d);
-  };
-  add('device_mac', last.device_mac);
-  add('来源 IP', last.source_ip || '—');
-  add('boot_id', last.boot_id + '（每次重启变化）');
-  add('固件版本', last.fw_version || '—');
-  add('批内样本数', String(last.n_readings));
-  add('本批上报的板上丢弃', String(last.dropped_since_last));
-  add('服务端接收时刻', fmtTime(last.t_server_recv_ms) + '（权威时间）');
-  add('设备时间（NTP 换算）', last.t_device_ntp_ms ? fmtTime(last.t_device_ntp_ms) : '未提供');
-  add('设备时钟偏差', last.device_clock_skew_ms === null ? '—'
-      : (last.device_clock_skew_ms / 1000).toFixed(3) + ' s（设备 - 服务端）');
-  add('时间戳可信度', TRUST_TEXT[last.t_trust] + '（NTP 同步年龄 '
-      + (last.ntp_sync_age_s === null ? '—' : last.ntp_sync_age_s + ' s') + '）',
-      'b-' + last.t_trust);
-  p.appendChild(kv);
-}
-
-function renderTable(rows) {
-  const tb = $('tbody');
-  tb.innerHTML = '';
-  const view = rows.slice(-400).reverse();
-  let prev = null;
-  for (const r of view) {
-    const tr = el('tr', prev && prev.t_server_recv_ms !== r.t_server_recv_ms ? 'peer' : '');
-    const mag = (r.ax === null || r.ay === null || r.az === null)
-      ? null : Math.hypot(r.ax, r.ay, r.az);
-    const trust = trustOf(r.ntp_synced, r.ntp_sync_age_s);
-    const cells = [
-      [String(r.seq), 'l'], [r.boot_id, 'l'],
-      [fmtTime(r.t_device_ms), ''], [fmtTime(r.t_server_recv_ms), ''],
-      [r.ax === null ? '—' : r.ax.toFixed(3), ''],
-      [r.ay === null ? '—' : r.ay.toFixed(3), ''],
-      [r.az === null ? '—' : r.az.toFixed(3), ''],
-      [mag === null ? '—' : mag.toFixed(3), ''],
-      [r.spl_db === null ? 'null' : r.spl_db.toFixed(1), ''],
-    ];
-    for (const [txt, cls] of cells) tr.appendChild(el('td', cls, txt));
-    const tdT = el('td', 'l');
-    tdT.appendChild(el('span', 'badge b-' + trust, TRUST_TEXT[trust]));
-    tr.appendChild(tdT);
-    tr.appendChild(el('td', 'l', r.source_ip || '—'));
-    tb.appendChild(tr);
-    prev = r;
-  }
-  if (!view.length) {
-    const tr = el('tr');
-    const td = el('td', 'l', '无数据');
-    td.colSpan = 11;
-    tr.appendChild(td);
-    tb.appendChild(tr);
-  }
-}
-
-// 按钮状态由当前开关决定，不是自己记一个。两处状态必然会漂移——
-// 比如另一个标签页按了停止，这里还显示"停止"可点，点下去反而把采集开回来。
 function renderControl() {
   const known = !!ctl;
   $('ctl_state').textContent = !known ? '采集状态未知'
     : (ctl.collect ? '采集：开' : '采集：已停止')
-      + (ctl.changed_ago_ms === null ? '' : '（' + fmtAge(ctl.changed_ago_ms) + '前）')
-      + (ctl.note ? '　' + ctl.note : '');
+      + (ctl.changed_ago_ms === null ? '' : '（' + fmtAge(ctl.changed_ago_ms) + '前）');
   $('btn_start').disabled = !known || ctl.collect || ctlBusy;
   $('btn_stop').disabled  = !known || !ctl.collect || ctlBusy;
 }
@@ -632,7 +426,7 @@ async function onControl(collect) {
   renderControl();
   try {
     let r = await fetch(api('/api/v1/control'), {
-      method:'POST', headers: ctlHeaders(),
+      method: 'POST', headers: ctlHeaders(),
       body: JSON.stringify({ collect, note: collect ? '界面手动开始' : '界面手动停止' }),
     });
     if (r.status === 401) {
@@ -640,14 +434,13 @@ async function onControl(collect) {
       if (t) { ctlToken = t; try { localStorage.setItem('ctl_token', t); } catch (e) {} }
       if (!t) throw new Error('未提供 CONTROL_TOKEN');
       r = await fetch(api('/api/v1/control'), {
-        method:'POST', headers: ctlHeaders(),
+        method: 'POST', headers: ctlHeaders(),
         body: JSON.stringify({ collect, note: collect ? '界面手动开始' : '界面手动停止' }),
       });
     }
     if (!r.ok) throw new Error('HTTP ' + r.status);
   } catch (e) {
-    setAlarm('crit', (collect ? '开启' : '停止') + '采集失败',
-             String(e.message || e) + '　开关状态未改变。');
+    setAlarm('crit', (collect ? '开启' : '停止') + '采集失败', String(e.message || e));
   } finally {
     ctlBusy = false;
     tick();
@@ -659,11 +452,10 @@ async function tick() {
   if (inflight) return;
   inflight = true;
   try {
-    const limit = $('limit').value;
     const [sr, rr, cr] = await Promise.all([
-      fetch(api('/api/v1/status'), { cache:'no-store' }),
-      fetch(api('/api/v1/readings?limit=' + limit), { cache:'no-store' }),
-      fetch(api('/api/v1/control'), { cache:'no-store' }),
+      fetch(api('/api/v1/status'), { cache: 'no-store' }),
+      fetch(api('/api/v1/readings?limit=3000'), { cache: 'no-store' }),
+      fetch(api('/api/v1/control'), { cache: 'no-store' }),
     ]);
     if (!sr.ok || !rr.ok || !cr.ok) throw new Error('HTTP ' + sr.status + '/' + rr.status + '/' + cr.status);
     const st = await sr.json(), rd = await rr.json(), cd = await cr.json();
@@ -675,111 +467,326 @@ async function tick() {
     series.stopped = !cd.collect;
 
     renderCards(st, rows, series);
-    renderProv(st, rows);
-    renderTable(rows);
+    drawChart($('c_acc'), series, { field: 'mag', color: '#222', decimals: 3,
+                                    refLine: 1.0, include: [1.0] });
 
-    // SPL 可能整段为 null（麦克风通道没出数），提示框不能假定它一定存在
-    const tipFor = (field, label, unit, dec) => p => {
-      const v = p[field];
-      const head = v === null || v === undefined
-        ? label + '=无有效数据（通道无输出）'
-        : label + '=' + v.toFixed(dec) + ' ' + unit;
-      return 'seq ' + p.raw.seq + '  ' + head + '\n'
-           + fmtTime(p.x) + '\n' + TRUST_TEXT[p.trust] + '  ' + p.raw.boot_id
-           + '  ' + (p.raw.source_ip || '—');
-    };
-    drawChart($('c_acc'), $('tip_acc'), series, {
-      field:'mag', color:COL.ok, decimals:3, refLine:1.0, include:[1.0],
-      tip: tipFor('mag', '|a|', 'g', 3),
-    });
-    drawChart($('c_spl'), $('tip_spl'), series, {
-      field:'spl', color:COL.info, decimals:1,
-      tip: tipFor('spl', 'SPL', 'dB', 1),
-    });
-
-    // 报警优先级从"根本收不到"到"收到了但有瑕疵"。
-    // 时间戳可信度必须在这条链里，不能另起一行附注——否则会出现
-    // 主行说"时间戳可信"、附注说"存在非新鲜时间戳"这种自相矛盾的提示。
     const last = st.last_batch;
     const missingN = series.bands.reduce((n, b) => {
       const m = /^丢样 (\d+)/.exec(b.reason);
       return n + (m ? parseInt(m[1], 10) : 0);
     }, 0);
     const recentDrop = last ? last.dropped_since_last : 0;
-
     const counts = rd.trust.counts || {};
-    const nonFresh = Object.entries(counts).filter(([t]) => t !== 'ntp_fresh');
-    const nonFreshN = nonFresh.reduce((n, [, c]) => n + c, 0);
-
+    const nonFreshN = Object.entries(counts)
+      .filter(([t]) => t !== 'ntp_fresh').reduce((n, [, c]) => n + c, 0);
     const stopped = !cd.collect;
-    // 停止后设备应该很快安静下来。若停止指令下发很久之后还在收到新批次，
-    // 说明板子没轮询到指令（或固件没更新）——这不能一路滑进"已停止采集"那个
-    // 中性提示里，否则一次真实的失灵会被描述成用户自己的操作。
     const ignoring = stopped && cd.t_server_ms !== null
       && last && last.t_server_recv_ms > cd.t_server_ms + OFFLINE_MS;
 
     if (!last) {
-      setAlarm('crit', '无数据', rows.length
-        ? '查询窗口内没有任何样本。'
-        : '服务端从未收到任何批次。检查设备供电、WiFi 与服务端地址。');
+      setAlarm('crit', '无数据', rows.length ? '查询窗口内没有任何样本。'
+               : '服务端从未收到任何批次。');
     } else if (ignoring) {
-      setAlarm('warn', '已下发停止，但仍在收到数据',
-        '停止指令 ' + fmtTime(cd.t_server_ms) + ' 下发，之后仍收到 '
-        + fmtTime(last.t_server_recv_ms) + ' 的批次。设备未执行该指令。');
-    } else if (stopped && last.age_ms > ONLINE_MS) {
-      // 中性色而非红色：这段空白是用户自己按出来的。但"停止期间的数据确实不存在"
-      // 必须说清楚，不能让中性色被读成"什么都没发生"。
-      setAlarm('info', '已停止采集 · ' + (cd.changed_ago_ms === null ? '' : fmtAge(cd.changed_ago_ms) + '前停止'),
-        '最后一次上传 ' + fmtTime(last.t_server_recv_ms) + '（' + last.device_mac + '）。'
-        + '此处的空白是主动停止而非设备故障，但停止期间的数据确实没有采集。');
+      setAlarm('warn', '已停止但仍在收到数据',
+               fmtTime(last.t_server_recv_ms) + ' 后仍收到批次，设备未执行停止。');
     } else if (stopped) {
-      setAlarm('info', '正在停止采集', '设备收尾中：把缓冲区里已采到的样本上传完再停。');
+      setAlarm('info', '已停止采集' + (cd.changed_ago_ms === null ? ''
+               : ' · ' + fmtAge(cd.changed_ago_ms) + '前停止'),
+               '最后上传 ' + fmtTime(last.t_server_recv_ms) + '。');
     } else if (last.age_ms > OFFLINE_MS) {
-      setAlarm('crit', '设备失联 · 已有 ' + fmtAge(last.age_ms) + ' 无数据',
-        '最后一次上传 ' + fmtTime(last.t_server_recv_ms) + '（' + last.device_mac + '）。'
-        + '界面停止更新即代表设备或网络断了，不是"没有事件发生"。');
+      setAlarm('crit', '设备失联 · 已 ' + fmtAge(last.age_ms) + ' 无数据',
+               '最后上传 ' + fmtTime(last.t_server_recv_ms) + '。');
     } else if (last.age_ms > ONLINE_MS) {
-      setAlarm('warn', '数据延迟 · 最近一批 ' + fmtAge(last.age_ms) + ' 前',
-        '超过正常上传间隔（' + (UPLOAD_INTERVAL_MS / 1000) + ' 秒）3 倍。');
+      setAlarm('warn', '数据延迟 · 最近一批 ' + fmtAge(last.age_ms) + ' 前', '');
     } else if (missingN > 0) {
-      setAlarm('warn', '检测到丢样 · 窗口内共丢失 ' + missingN + ' 个样本',
-        '按 seq 跳号判定，缺口已在图上标成红带。');
+      setAlarm('warn', '丢样 ' + missingN + ' 个', '缺口已在曲线上标红。');
     } else if (recentDrop > 0) {
-      setAlarm('warn', '板上丢弃 ' + recentDrop + ' 个样本',
-        '上传持续失败导致环形缓冲溢出，设备已如实记账。');
+      setAlarm('warn', '板上丢弃 ' + recentDrop + ' 个样本', '');
     } else if (nonFreshN > 0) {
-      setAlarm('warn', '时间戳可信度不足 · ' + nonFreshN + ' / ' + rows.length + ' 个样本不可参考',
-        nonFresh.map(([t, c]) => TRUST_TEXT[t] + ' ' + c).join('，')
-        + '　服务端接收时间仍然权威，数据本身没有丢失。');
+      setAlarm('warn', '时间戳不可信 ' + nonFreshN + ' 个样本', '');
     } else if (st.total_dropped > 0) {
-      setAlarm('warn', '历史累计丢弃 ' + st.total_dropped + ' 个样本', '当前窗口内无新增丢失。');
+      setAlarm('warn', '历史累计丢弃 ' + st.total_dropped + ' 个样本', '');
     } else {
-      setAlarm('ok', '链路正常', '数据持续到达，无丢弃、无缺口、时间戳可信。');
+      setAlarm('ok', '链路正常', '');
     }
-
-    $('refreshed').textContent = '最近刷新 ' + new Date().toLocaleTimeString('zh-CN', { hour12:false })
-      + '　服务端时间 ' + fmtTime(st.server_time_ms);
   } catch (e) {
-    // 服务端本身不可达也必须看得见，不能停在旧数据上假装一切正常
     setAlarm('crit', '无法连接服务端', String(e.message || e));
   } finally {
     inflight = false;
   }
 }
 
-$('limit').addEventListener('change', tick);
+// ------------------------------------------------------------ 第4周：自然语言
+let askTimer = null;
+
+function renderCommandState(c, box) {
+  let line;
+  if (c.state === 'done') {
+    line = (c.n_samples > 0)
+      ? '采集完成：服务端实收 ' + c.n_samples + ' 条样本'
+      : '设备报告完成，但服务端未收到样本';
+  } else {
+    line = c.state_text;
+    if (!c.is_terminal && c.remaining_ms !== null) line += '（剩余 ' + fmtAge(c.remaining_ms) + '）';
+  }
+  box.textContent = line;
+}
+
+function pollCommand(rid, box, onTerminal) {
+  clearInterval(askTimer);
+  const step = async () => {
+    try {
+      const r = await fetch(api('/api/v1/commands/' + rid), { cache: 'no-store' });
+      if (!r.ok) return;
+      const c = (await r.json()).command;
+      renderCommandState(c, box);
+      if (c.is_terminal) {
+        clearInterval(askTimer);
+        if (onTerminal) onTerminal(box.textContent);
+      }
+    } catch (e) { /* 状态轮询失败不打断其它逻辑 */ }
+  };
+  step();
+  askTimer = setInterval(step, 2000);
+}
+
+async function askText(text) {
+  // 文字入口与语音入口共用同一条 NL 处理：查询/采集/澄清/取消全复用，不另写一套。
+  let r = await fetch(api('/api/v1/assistant/chat'), {
+    method: 'POST', headers: ctlHeaders(),
+    body: JSON.stringify({ text, context_id: VOICE_CTX }),
+  });
+  if (r.status === 401) {
+    const t = window.prompt('服务端设置了 CONTROL_TOKEN，请求采集/取消需要它：');
+    if (!t) throw new Error('未提供 CONTROL_TOKEN');
+    ctlToken = t; try { localStorage.setItem('ctl_token', t); } catch (e) {}
+    r = await fetch(api('/api/v1/assistant/chat'), {
+      method: 'POST', headers: ctlHeaders(),
+      body: JSON.stringify({ text, context_id: VOICE_CTX }),
+    });
+  }
+  if (!r.ok) {
+    let d = null;
+    try { d = await r.json(); } catch (e) {}
+    throw new Error((d && d.error && d.error.message) || 'HTTP ' + r.status);
+  }
+  return await r.json();
+}
+
+async function onAsk() {
+  const text = $('ask_in').value.trim();
+  if (!text) return;
+  clearInterval(askTimer);
+  voiceEpoch++; stopSpeaking();          // 文字新输入 = 新任务：打断旧播报
+  const out = $('ask_out');
+  out.innerHTML = '';
+  try {
+    const j = await askText(text);
+    if (isCancelIntent(j)) {
+      appendMsg(j.answer); applyTiming(j);
+      return;
+    }
+    out.appendChild(el('div', 'ans', j.answer));
+    applyTiming(j);
+    if (j.command) {
+      const box = el('div', 'stat');
+      out.appendChild(box);
+      pollCommand(j.command.request_id, box);
+    }
+  } catch (e) {
+    out.appendChild(el('div', 'ans', String(e.message || e)));
+  }
+}
+
+// ------------------------------------------------------------ 第5周：按键说话
+// 半双工：一次只走一个环节。录音中/识别中/执行中/播放中是四个色点（红=进行中）。
+let rec = null, recChunks = [], recStream = null;
+
+// ------------------------------------------------------------ 第6周：可澄清、可停止
+// 会话上下文：整页自持一个 context_id（服务端按它记录澄清/取消/时序）。
+// epoch：新任务 / 取消时 +1；迟到应答（旧任务的 TTS、迟到的指令终态播报）
+// 一律按 epoch 对不上号丢弃——"新任务不被旧任务结果覆盖"的前端一半。
+const VOICE_CTX = (globalThis.crypto && crypto.randomUUID
+                  ? crypto.randomUUID()
+                  : 'c' + Date.now().toString(36) + Math.random().toString(36).slice(2, 14));
+let voiceEpoch = 0;
+let ttsAudio = null;
+
+function setDot(which) {
+  for (const k of ['rec', 'asr', 'run', 'play']) {
+    const d = $('st_' + k);
+    if (d) d.classList.toggle('on', k === which);
+  }
+}
+
+function appendMsg(msg) {
+  $('ask_out').appendChild(el('div', 'ans', msg));
+}
+
+async function pttStart() {
+  if (rec) return;
+  voiceEpoch++; stopSpeaking();          // 新语音任务：打断旧播报，旧任务应答作废
+  clearInterval(askTimer);
+  $('ask_out').innerHTML = '';
+  setDot('rec');
+  try {
+    recStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  } catch (e) {
+    setDot(null);
+    appendMsg('录音失败：麦克风不可用');
+    return;
+  }
+  recChunks = [];
+  rec = new MediaRecorder(recStream);
+  rec.ondataavailable = ev => { if (ev.data && ev.data.size) recChunks.push(ev.data); };
+  rec.onstop = onPttStop;
+  rec.start();
+  $('ptt_btn').textContent = '停止';
+}
+
+function pttStop() {
+  if (!rec) return;
+  rec.stop();
+  if (recStream) { recStream.getTracks().forEach(t => t.stop()); recStream = null; }
+  $('ptt_btn').textContent = '按讲';
+}
+
+async function onPttStop() {
+  const mr = rec; rec = null;
+  const blob = new Blob(recChunks, { type: (mr && mr.mimeType) || 'audio/webm' });
+  if (!blob.size) { setDot(null); appendMsg('识别失败：无有效语音'); return; }
+  const myEpoch = voiceEpoch;              // 本次语音任务快照：迟到应答对不上号就丢
+  setDot('asr');
+  try {
+    const fd = new FormData();
+    fd.append('file', blob, 'ptt.webm');
+    let r = await fetch(api('/api/v1/voice/transcribe'), { method: 'POST', body: fd });
+    if (!r.ok) {
+      let d = null; try { d = await r.json(); } catch (e) {}
+      throw new Error((d && d.error && d.error.message) || '识别失败：HTTP ' + r.status);
+    }
+    const text = (await r.json()).text;
+    if (!text) throw new Error('识别失败：无有效语音');
+    // 识别出的文本走第 4 周同一条 NL 处理（查询/采集/澄清/取消全复用）
+    setDot('run');
+    const j = await askText(text);
+    if (voiceEpoch !== myEpoch) return;    // 已取消/被新任务顶掉：迟到应答不播不显示
+    appendMsg(j.answer);
+    applyTiming(j);
+    if (isCancelIntent(j)) {
+      // 语音口令"取消/停止"：播报一句确认即可，其余内容一律不碰
+      await ttsSpeak(j.answer, myEpoch);
+      return;
+    }
+    if (j.command) {
+      // 采集：等指令终态后再播报"最终回答"，避免把中间态说成结果。
+      const box = el('div', 'stat');
+      $('ask_out').appendChild(box);
+      pollCommand(j.command.request_id, box, async t => {
+        if (voiceEpoch !== myEpoch) return; // 迟到终态：任务已被取消/顶掉，不播
+        try {
+          const rc = await fetch(api('/api/v1/voice/context')
+            + '?context_id=' + encodeURIComponent(VOICE_CTX), { cache: 'no-store' });
+          const jc = await rc.json();
+          const tl = jc.context && jc.context.timing;
+          if (tl && tl.latency_ms != null) appendMsg('⏱ 完成延迟 ' + tl.latency_ms + 'ms');
+        } catch (e) { /* 拿不到计时不影响播报 */ }
+        ttsSpeak(t, myEpoch);
+      });
+      return;
+    }
+    await ttsSpeak(j.answer, myEpoch);
+  } catch (e) {
+    if (voiceEpoch !== myEpoch) return;
+    setDot(null);
+    appendMsg(String(e.message || e));
+  }
+}
+
+// 第6周：停止播报 + 回到空闲
+function stopSpeaking() {
+  if (ttsAudio) {
+    try { ttsAudio.pause(); ttsAudio.src = ''; } catch (e) {}
+    ttsAudio = null;
+  }
+  setDot(null);
+  clearInterval(askTimer);
+}
+
+// 文字停止按钮（备用路径）：停播报、断轮询，让服务端撤销/停止关注
+function doCancel() {
+  voiceEpoch++;
+  stopSpeaking();
+  appendMsg('已停止播报，正在撤销任务…');
+  askText('取消')
+    .then(j => {
+      appendMsg(j.answer);
+      applyTiming(j);
+    })
+    .catch(e => appendMsg(String(e.message || e)));
+}
+
+function isCancelIntent(j) {
+  return !!(j && j.intent && j.intent.action === 'cancel');
+}
+
+// 首答延迟展示（输入结束 → 首次反馈）
+function applyTiming(j) {
+  const t = j && j.context && j.context.timing;
+  if (t && t.ttff_ms != null) appendMsg('⏱ 首答 ' + t.ttff_ms + 'ms');
+}
+
+async function ttsSpeak(text, epoch = voiceEpoch) {
+  if (!text) return;
+  if (epoch !== voiceEpoch) return;        // 迟到：已被取消/新任务顶掉
+  setDot('play');
+  try {
+    const r = await fetch(api('/api/v1/voice/speak'), {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text }),
+    });
+    if (!r.ok) {
+      let d = null; try { d = await r.json(); } catch (e) {}
+      throw new Error((d && d.error && d.error.message) || '合成失败：HTTP ' + r.status);
+    }
+    if (epoch !== voiceEpoch) return;      // 合成回来前已被打断
+    const audio = new Audio(URL.createObjectURL(await r.blob()));
+    ttsAudio = audio;
+    await new Promise(res => {
+      audio.onended = () => { if (ttsAudio === audio) ttsAudio = null; res(); };
+      audio.onerror = () => { if (ttsAudio === audio) ttsAudio = null; res(); };
+      audio.play().catch(() => { if (ttsAudio === audio) ttsAudio = null; res(); });
+    });
+  } catch (e) {
+    appendMsg(String(e.message || e));
+  } finally {
+    if (epoch === voiceEpoch) setDot(null);
+  }
+}
+
+(async () => {
+  // 运行位置：服务端如实告诉你音频来源（设备音频已接通才标"设备音频"）
+  try {
+    const r = await fetch(api('/api/v1/voice/info'), { cache: 'no-store' });
+    if (r.ok) {
+      const j = await r.json();
+      $('voice_origin').textContent =
+        j.device_audio ? '设备音频·板载I2S' : '电脑音频·浏览器';
+    }
+  } catch (e) { /* 拿不到就保持默认标注 */ }
+})();
+
 $('btn_start').addEventListener('click', () => onControl(true));
 $('btn_stop').addEventListener('click', () => onControl(false));
+$('ask_btn').addEventListener('click', onAsk);
+$('ask_in').addEventListener('keydown', ev => { if (ev.key === 'Enter') onAsk(); });
+$('ptt_btn').addEventListener('click', () => { if (rec) pttStop(); else pttStart(); });
+$('vt_stop').addEventListener('click', doCancel);
 window.addEventListener('resize', tick);
 tick();
 setInterval(tick, UPLOAD_INTERVAL_MS);
 
-// 页面用 file:// 打开时要连的是哪台服务端，只有打开的人知道。
-// 把当前实际用的地址摆出来，省得"没数据"的时候要靠猜。
-if (API) document.title = 'ESP32-S3-EYE 遥测 · ' + API;
-
-// 交给 commands.js 复用。ctlToken 用 getter 暴露：它是一个会被 401 流程改写的
-// 局部变量，直接赋值副本的话，两个面板会各自持有一份令牌，很快就对不上。
+// 交给 commands.js 复用。
 window.DASH = {
   $, api, el, setAlarm, fmtTime, fmtAge, COL, trustOf, TRUST_TEXT, ctlHeaders,
   get ctlToken() { return ctlToken; },

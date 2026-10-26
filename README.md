@@ -84,6 +84,16 @@ flowchart TB
 esp32-s3-eye-telemetry/
 ├── README.md                        ← 本文件
 ├── start_server.bat                 Windows 一键启动服务端
+├── .github/workflows/
+│   └── week-progress.yml            每天北京时间 00:00 的"单周粒度、状态驱动"周进度流水线
+├── scripts/
+│   ├── next-week.mjs                状态机：读 state → 结清合并 → 选周 → 建分支 → 回写 inProgress
+│   └── open-pr.mjs                  开本周 PR（标题 week-N: <摘要>，正文含改动/UI 精简/ui_check/替换说明）
+├── prompts/
+│   ├── week-4.md                    第 4 周任务模板（含 UI 约束与完成定义）
+│   └── week-5.md                    第 5 周任务模板
+├── state/
+│   └── week-progress.json           周进度状态（lastCompletedWeek / redo / inProgress）
 ├── docs/
 │   ├── development-log.md           开发复盘：分阶段记录坑与验证结果
 │   ├── week2-commands.md            第2周：远程指令通道的设计与验证（状态机/协议/端点）
@@ -115,6 +125,7 @@ esp32-s3-eye-telemetry/
     │   ├── fix_firewall.ps1         修防火墙：禁用全局入站拦截 + 放行端口（自动提权）
     │   ├── fault_inject.py          故障注入：主动制造失败以验证"失败可见"
     │   ├── command_sim.py           假设备模拟器 + 故障注入，打真实 HTTP（162 断言）
+    │   ├── seed_ui.py               为 ui_check 预置确定性演示数据（丢样/重启/停止/未同步）
     │   └── ui_check.mjs             DOM 打桩跑界面脚本，断言报警判定与前端防抖
     ├── .env.example                 配置模板 → 复制成 .env
     └── data/telemetry.db            运行期数据库，.gitignore 排除
@@ -532,6 +543,33 @@ python tools/fault_inject.py --url http://127.0.0.1:8001
 
 `ui_check.mjs` 把 `index.html` 里的脚本抠出来，用最小 DOM 桩在 node 里跑，断言报警等级
 与文案。这样"该报警时必须报警"可以被确定性地回归，而不必真去拔电源。
+
+---
+
+## 自动化：周进度状态机（单周粒度、状态驱动）
+
+仓库内置一条每天 **北京时间 00:00**（cron `0 16 * * *` UTC）触发的周进度流水线，
+一次只做一个周，全流程由 `state/week-progress.json` 驱动：
+
+1. **决策**（`scripts/next-week.mjs`）：
+   - `inProgress` 有值且对应 PR 未合并 → 本次继续该周（wait），不推进；
+   - 否则 `redo` 队列非空 → 取 `redo[0]`（重做，分支 `week-N-redo`）；
+   - 否则执行 `lastCompletedWeek + 1`（分支 `week-N`）。
+2. **分支**：从 `main` 新建只属于该周的分支；重做分支上说明"替换原第 N 周实现"，
+   已推送的旧代码不回退 main。状态随分支走：PR 合并时 `week-progress.json` 并入 main，
+   全程不直接推 main。
+3. **执行**：按 `prompts/week-N.md` 完成本周功能（开发智能体；未配置时由外部智能体接手）。
+4. **门槛**：`node tools/ui_check.mjs` 必须通过（失败即停、保留日志、不开 PR、状态保持
+   `inProgress`，下一轮继续该周）。
+5. **开 PR**（`scripts/open-pr.mjs`）：标题 `week-N: <摘要>`，正文写明本周改动、UI 精简点、
+   ui_check 结果；**不重复开同一周的 PR、不自动合并**。
+
+本地手动触发同一套逻辑：
+
+```bash
+node scripts/next-week.mjs            # 决策（--plan 只看不改）
+node scripts/open-pr.mjs --ui-check-log .artifacts/ui_check-week-4.log   # 开本周 PR
+```
 
 ---
 

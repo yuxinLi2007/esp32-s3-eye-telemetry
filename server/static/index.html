@@ -522,9 +522,19 @@ let askTimer = null;
 function renderCommandState(c, box) {
   let line;
   if (c.state === 'done') {
-    line = (c.n_samples > 0)
-      ? '采集完成：服务端实收 ' + c.n_samples + ' 条样本'
-      : '设备报告完成，但服务端未收到样本';
+    if (c.op === 'image') {
+      const r = c.result || {};
+      if (r.captured_at_ms != null) {
+        line = '图像采集完成：服务端 ' + fmtTime(r.captured_at_ms) + ' 收到（'
+             + (r.source === 'replay' ? '回放' : '实拍') + '）';
+      } else {
+        line = '图像采集完成（未收到图像回执）';
+      }
+    } else {
+      line = (c.n_samples > 0)
+        ? '采集完成：服务端实收 ' + c.n_samples + ' 条样本'
+        : '设备报告完成，但服务端未收到样本';
+    }
   } else {
     line = c.state_text;
     if (!c.is_terminal && c.remaining_ms !== null) line += '（剩余 ' + fmtAge(c.remaining_ms) + '）';

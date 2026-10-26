@@ -20,6 +20,7 @@ from pydantic import BaseModel, Field
 import assistant
 import commands
 import db
+import snapshots
 import task_context
 import voice
 
@@ -42,6 +43,7 @@ CONTROL_TOKEN = os.environ.get("CONTROL_TOKEN")
 async def lifespan(_app):
     conn = db.init_db(DB_PATH)
     commands.init_schema(conn)
+    snapshots.ensure_schema(conn)
     conn.close()
     if not INGEST_TOKEN:
         print(
@@ -306,6 +308,15 @@ async def voice_error_handler(_request: Request, exc: voice.VoiceError):
     )
 
 
+@app.exception_handler(snapshots.SnapshotError)
+async def snapshot_error_handler(_request: Request, exc: snapshots.SnapshotError):
+    """图像通道（第7周）的错误出口，shape 与指令层一致：code + message。"""
+    return JSONResponse(
+        status_code=exc.http_status,
+        content={"ok": False, "error": {"code": exc.code, "message": exc.message}},
+    )
+
+
 class CommandCreate(BaseModel):
     device_mac: str
     op: str
@@ -441,6 +452,77 @@ def command_result(request_id: str, payload: CommandResultIn, conn=Depends(get_c
     }
 
 
+# ============================================================ 第7周：按需环境快照
+#
+# 图像通道与指令通道同构：
+#   下发（CONTROL_TOKEN）-> 设备领取（INGEST_TOKEN）-> 传图 POST /commands/{rid}/image
+#   -> done 回执（INGEST_TOKEN）。done 回执前必须先传图（commands.apply_result 强制），
+#   图像记录（snapshots 表 + 磁盘文件）带服务端接收时刻（权威）与设备声称采集时刻（参考）。
+#   终止指令一律拒收图像：迟到/重放的旧图绝不可能挂到新请求上、
+#   也不可能让一次已撤销/失败变成"成功"。
+
+
+def _hint(v):
+    """把请求头里的整数 hint 转成 int/None，坏值按没有处理（不因头写错 500）。"""
+    if v is None:
+        return None
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+@app.post("/api/v1/commands/{request_id}/image",
+          dependencies=[Depends(require_ingest_token)])
+async def command_image_upload(request_id: str, request: Request,
+                               conn=Depends(get_conn)):
+    """设备上传一张图（字节流）。任何失败都带明确错误码（改布局见 SnapshotError）。
+    幂等：同一 request_id 重复上传拿到同一条记录，不产生第二张图。"""
+    data = await request.body()
+    snap = snapshots.store(
+        conn, request_id, data,
+        device_mac=request.headers.get("x-device-mac"),
+        boot_id=request.headers.get("x-boot-id"),
+        source=request.headers.get("x-source") or "camera",
+        t_captured_ms=_hint(request.headers.get("x-captured-at-ms")),
+        width=_hint(request.headers.get("x-width")),
+        height=_hint(request.headers.get("x-height")),
+        content_type=request.headers.get("content-type") or "image/jpeg",
+    )
+    return {"ok": True, "snapshot": snapshots._meta(snap),
+            "server_time_ms": int(time.time() * 1000)}
+
+
+@app.get("/api/v1/snapshots")
+def snapshots_list(
+    limit: int = Query(default=50, ge=1, le=200),
+    request_id: str | None = Query(default=None, description="只看某条图像指令的图"),
+    conn=Depends(get_conn),
+):
+    rows = snapshots.list_snapshots(conn, limit=limit, request_id=request_id)
+    return {"ok": True, "count": len(rows), "snapshots": [snapshots._meta(r) for r in rows]}
+
+
+@app.get("/api/v1/snapshots/{snapshot_id}/image")
+def snapshot_image(snapshot_id: int, conn=Depends(get_conn)):
+    """图像本体字节流。文件已按"最少保留"清理时如实 404（元数据不见了就看图不见）。"""
+    row = snapshots.get(conn, snapshot_id)
+    if row is None:
+        raise HTTPException(status_code=404,
+                            detail={"code": "snapshot_not_found",
+                                    "message": "图像记录不存在（可能已被最少保留策略清理）"})
+    p = snapshots.path_for(row)
+    if not p.is_file():
+        raise HTTPException(status_code=404,
+                            detail={"code": "image_file_missing",
+                                    "message": "图像文件已缺失（最少保留已清理或磁盘异常）"})
+    return Response(content=p.read_bytes(),
+                    media_type=row["content_type"] or "image/jpeg",
+                    headers={"X-Snapshot-Id": str(row["id"]),
+                             "X-Source": row["source"] or "camera",
+                             "X-Captured-At-Ms": str(row["t_server_recv_ms"])})
+
+
 # ============================================================ 第4周：自然语言入口
 #
 # 查询与请求采集分离：query 只读已有记录；collect 走 commands.create（改设备行为），
@@ -463,8 +545,8 @@ def assistant_chat(payload: ChatIn, request: Request, conn=Depends(get_conn)):
                     "message": "context_id 格式非法"},
         )
     result = assistant.chat(conn, payload.text, context_id=payload.context_id)
-    # collect（改设备行为）与 cancel（改指令状态）都是会改变状态的，同级别鉴权。
-    if result["intent"]["action"] in ("collect", "cancel"):
+    # collect / image（改设备行为）与 cancel（改指令状态）都是会改变状态的，同级别鉴权。
+    if result["intent"]["action"] in ("collect", "cancel", "image"):
         require_control_token(request)
     return {
         "ok": True,

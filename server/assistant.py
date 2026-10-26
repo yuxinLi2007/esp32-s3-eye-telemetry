@@ -1,4 +1,5 @@
 """第4周：自然语言入口 —— 「查看已有数据」与「请求重新采集」的分类与诚实回答。
+（第7周起新增第 4 类动作：按需环境图像 "image"——"拍照/看看环境" 走 image 指令。）
 
 两条铁律（对着课程第 4 周的验收点）：
   1. 查询与请求采集必须分离：查询只读记录、绝不改设备行为；请求采集必须走
@@ -63,6 +64,14 @@ CANCEL_WORDS = (
     "取消", "撤销", "算了", "别采了", "不采了", "不要了", "停下来",
     "停止采集", "停止播报", "别说了", "闭嘴", "停了吧", "别播了", "停",
 )
+# 第7周：按需环境快照 —— "拍一张环境图 / 看看环境"。全部用多字动作短语，
+# 不带裸词（"环境/图像/画面"），避免把"查看环境数据"这类采集/查询句子误判成图像。
+IMAGE_WORDS = (
+    "拍照", "拍张照", "拍个照", "拍一张", "拍照片", "拍一下",
+    "看看环境", "查看环境", "看下环境", "看环境",
+    "查看画面", "看看画面", "看下画面",
+    "环境图像", "环境的图像", "环境快照",
+)
 
 TRUST_TEXT = {
     "ntp_fresh": "NTP 新鲜", "ntp_stale": "NTP 陈旧",
@@ -98,8 +107,13 @@ def _keyword_action(text):
         return "cancel"
     has_collect = any(w in text for w in COLLECT_WORDS)
     has_query = any(w in text for w in QUERY_WORDS)
-    if has_collect and has_query:
+    has_image = any(w in text for w in IMAGE_WORDS)
+    if (has_collect and has_query) or (has_collect and has_image):
         return "mixed"
+    if has_image:
+        # 图像词优先于通用查询词："看看环境"是拍照，不是"查看数据"。
+        # collect 与 image 同可能是"拜托再来一次"语感，交给人澄清。
+        return "image"
     if has_collect:
         return "collect"
     if has_query:
@@ -134,7 +148,7 @@ def _parse_llm_json(content):
     if not isinstance(obj, dict):
         return None
     action = obj.get("action")
-    if action not in ("query", "collect", "cancel"):
+    if action not in ("query", "collect", "cancel", "image"):
         return None
     out = {"action": action}
     mac = obj.get("device_mac")
@@ -157,13 +171,15 @@ def _ask_llm(text):
         "model": model,
         "messages": [
             {"role": "system", "content": (
-                "你是遥测系统的自然语言入口。把用户的请求分类成三类任务之一，"
+                "你是遥测系统的自然语言入口。把用户的请求分类成四类任务之一，"
                 "只输出一个 JSON 对象，不要输出其它文字：\n"
                 "1) 查看已有数据：{\"action\":\"query\"}\n"
                 "2) 请求设备重新采集：{\"action\":\"collect\","
                 "\"device_mac\":\"AA:BB:CC:DD:EE:FF\"或null,"
                 "\"n\":\"样本数\"或null,\"interval_ms\":\"间隔毫秒\"或null}\n"
                 "3) 取消/停止当前任务：{\"action\":\"cancel\"}\n"
+                "4) 请求拍一张环境图像/看看画面：{\"action\":\"image\","
+                "\"device_mac\":\"AA:BB:CC:DD:EE:FF\"或null}\n"
                 "设备 MAC 只在用户明确给出时填写；n / interval_ms 只在用户明确提出时填写。")},
             {"role": "user", "content": text},
         ],
@@ -188,7 +204,7 @@ def _ask_llm(text):
 # ---------------------------------------------------------------- 意图解析
 def parse_intent(text, devices):
     """返回 {action, device_mac, params, reason}。
-    action ∈ query / collect / clarify / refuse。
+    action ∈ query / collect / image / cancel / clarify / refuse / status。
     """
     t = (text or "").strip()
     if not t:
@@ -208,8 +224,9 @@ def parse_intent(text, devices):
     kw = _keyword_action(t)
     if kw == "mixed":
         return {"action": "clarify", "device_mac": None, "params": {},
-                "reason": "一句话里同时包含“查看”和“重新采集”，请分开说："
-                          "要先看数据就说“查看数据”，要重新采就说“重新采集”。"}
+                "reason": "一句话里同时包含互相冲突的动作（查看/重新采集/拍照），"
+                          "请分开说：要看数据就说“查看数据”，要重新采就说"
+                          "“重新采集”，要看环境就说“看看环境”。"}
 
     action = kw
     params = _keyword_params(t)
@@ -254,6 +271,18 @@ def parse_intent(text, devices):
                     "reason": "检测到多台已知设备：%s；请说明针对哪一台。"
                               % "、".join(sorted(devices))}
         return {"action": action, "device_mac": devices[0], "params": params,
+                "reason": "ok"}
+
+    if action == "image":
+        # 拍照也要落到某台设备上（复用和第 4 周采集一样的设备范围与澄清口径）
+        if not devices:
+            return {"action": "refuse", "device_mac": None, "params": {},
+                    "reason": "本系统还没有见过任何设备，无法请求拍照。"}
+        if len(devices) > 1:
+            return {"action": "clarify", "device_mac": None, "params": {},
+                    "reason": "检测到多台已知设备：%s；请说明要对哪一台拍照。"
+                              % "、".join(sorted(devices))}
+        return {"action": action, "device_mac": devices[0], "params": {},
                 "reason": "ok"}
 
     # query：没指定设备也没关系，就答全系统最近的数据
@@ -337,38 +366,90 @@ def collect_answer(conn, text, intent):
     return {"intent": intent, "answer": answer, "command": cmd, "error_code": None}
 
 
+# 失败/不可用原因的人话映射（第7周：镜头遮挡 / 画面不可用要能读得懂）
+IMAGE_FAIL_TEXT = {
+    "occluded": "镜头遮挡或画面不可用",
+    "frame_unavailable": "画面不可用（无有效视频帧）",
+    "camera_error": "摄像头采集错误",
+}
+
+
+def image_answer(conn, text, intent):
+    """请求拍一张环境图：走指令通道下发 image；回答只看真实状态。
+
+    与 collect_answer 同一套口径：下发成功只答"已受理 + request_id"，
+    绝不在拿到图像回执前声称拍到了。
+    """
+    token = "ast-" + secrets.token_hex(8)
+    try:
+        row, deduped = commands.create(conn, device_mac=intent["device_mac"],
+                                       op="image", params={},
+                                       client_token=token,
+                                       note="assistant: " + text[:120],
+                                       created_by="assistant")
+    except commands.CommandError as exc:
+        return {"intent": intent, "answer": "下发失败：%s" % exc.message,
+                "command": None, "error_code": exc.code}
+
+    cmd = commands.to_dict(row, now=commands.now_ms(),
+                           events=commands.events_of(conn, row["request_id"]))
+    rid = cmd["request_id"]
+    if deduped:
+        answer = "该请求刚刚提交过，未重复下发：仍是指令 %s（%s）。" % (
+            rid, cmd["state_text"])
+    else:
+        answer = (
+            "已受理：图像指令 %s 已下发（设备最迟约 %d 秒领取）。"
+            "拿到画面会连同采集时刻一起显示，稍候。"
+            % (rid, cmd["ttl_ms"] // 1000)
+        )
+    return {"intent": intent, "answer": answer, "command": cmd, "error_code": None}
+
+
 def status_answer(conn):
-    """查询最近一条采集指令的真实状态（只读，不新发指令）。"""
+    """查询最近一条采集/图像指令的真实状态（只读，不新发指令）。"""
     commands.sweep(conn)   # 先把超期未领/执行超时结算掉，再回答
     row = conn.execute(
-        "SELECT * FROM commands WHERE op='capture'"
+        "SELECT * FROM commands WHERE op IN ('capture','image')"
         " ORDER BY t_created_ms DESC, rowid DESC LIMIT 1"
     ).fetchone()
     if row is None:
-        return "还没有下发过采集指令。"
+        return "还没有下发过采集或图像指令。"
     c = commands.to_dict(row)
     rid = c["request_id"]
     st = c["state"]
+    is_img = c["op"] == "image"
+    kind = "图像" if is_img else "采集"
     if st == "pending":
-        return "采集指令 %s 仍在等待设备领取。" % rid
+        return "%s指令 %s 仍在等待设备领取。" % (kind, rid)
     if st in ("claimed", "running"):
         pct = c["progress"] if c["progress"] is not None else "—"
-        return "设备正在执行采集（进度 %s%%）。" % pct
+        return "设备正在执行%s（进度 %s%%）。" % ("图像采集" if is_img else "采集", pct)
     if st == "done":
+        if is_img:
+            r = c.get("result") or {}
+            if r.get("captured_at_ms"):
+                src = "回放" if r.get("source") == "replay" else "实拍"
+                return ("图像采集完成：服务端 %s 收到画面（%s）。"
+                        % (_fmt_clock(r["captured_at_ms"]), src))
+            return "设备报告图像完成，但服务端没有收到图像。"   # 自查，绝不凭空报成功
         if c["n_samples"] and c["n_samples"] > 0:
             extra = ("，设备自报 %d 条" % c["n_samples_device"]) \
                 if c["n_samples_device"] else ""
             return "采集完成：服务端实收 %d 条样本%s。" % (c["n_samples"], extra)
         return "设备报告完成，但服务端没有收到任何新样本。"   # 自查 n_samples，绝不凭空报成功
     if st == "failed":
-        return "采集失败：%s" % (c["error_message"] or c["error_code"] or "未知原因")
+        code = c["error_code"] or ""
+        if is_img and code in IMAGE_FAIL_TEXT:
+            return "%s失败：%s。" % (kind, IMAGE_FAIL_TEXT[code])
+        return "%s失败：%s" % (kind, c["error_message"] or code or "未知原因")
     if st == "expired":
-        return "采集指令 %s 超期未被设备领取（设备离线或固件未更新？）。" % rid
+        return "%s指令 %s 超期未被设备领取（设备离线或固件未更新？）。" % (kind, rid)
     if st == "timeout":
-        return "采集指令 %s 执行超时，没有任何结果回执。" % rid
+        return "%s指令 %s 执行超时，没有任何结果回执。" % (kind, rid)
     if st == "cancelled":
-        return "采集指令 %s 已被撤销。" % rid
-    return "采集指令 %s 当前状态：%s。" % (rid, c["state_text"])
+        return "%s指令 %s 已被撤销。" % (kind, rid)
+    return "%s指令 %s 当前状态：%s。" % (kind, rid, c["state_text"])
 
 
 # ---------------------------------------------------------------- 对外入口
@@ -493,6 +574,15 @@ def _execute(conn, text, intent, devices, ctx, t0):
             task_context.log_event(ctx_id, "collect_issued", rid)
         return intent, out["answer"], out["command"], out["error_code"]
 
+    if action == "image":
+        out = image_answer(conn, text, intent)
+        if ctx_id is not None and out.get("command"):
+            rid = out["command"]["request_id"]
+            task_context.set_active(ctx_id, rid, "image",
+                                    out["command"].get("t_created_ms") or t0)
+            task_context.log_event(ctx_id, "image_issued", rid)
+        return intent, out["answer"], out["command"], out["error_code"]
+
     return intent, "无法理解这条请求，请换种说法。", None, None
 
 
@@ -504,7 +594,7 @@ def _answer(conn, ctx, text, devices, t0):
             resolved = _resolve_pick_device(text, pending["intent"], devices)
             if resolved is None:
                 kw = _keyword_action(text)
-                if kw in ("collect", "query", "cancel"):
+                if kw in ("collect", "query", "cancel", "image"):
                     # 用户在澄清中途改主意 / 换任务 / 喊停：新意图优先，
                     # 挂起的澄清直接作废（防止旧问题的答案覆盖新任务）。
                     task_context.clear_pending(ctx["context_id"])
@@ -541,7 +631,7 @@ def chat(conn, text, context_id=None):
 
     提供 context_id 时启用第 6 周会话上下文：有限多轮澄清、取消、迟到结果
     隔离（epoch）、request_id 关联日志与计时都挂在会话上；context 视图随响应返回。
-    只有 action == collect 或 cancel（都会改变设备行为/状态）需要 CONTROL_TOKEN，
+    只有会改变设备行为/状态的动作（collect / image / cancel）需要 CONTROL_TOKEN，
     由 app 层在拿到 result 后按其 intent.action 校验。
     """
     devices = known_devices(conn)

@@ -195,6 +195,13 @@
   }
 
   function resultSummary(c) {
+    if (c.op === 'image' && c.state === 'done') {
+      const r = c.result || {};
+      return r.captured_at_ms != null
+        ? '已获取画面 ' + fmtTime(r.captured_at_ms) + '（'
+          + (r.source === 'replay' ? '回放' : '实拍') + '）'
+        : '图像完成（无图像回执）';
+    }
     if (c.state === 'failed' || c.state === 'timeout') {
       const code = c.error_code || (c.state === 'timeout' ? 'timeout' : '');
       const msg = c.error_message || '';
@@ -363,6 +370,28 @@
       wrap.appendChild(el('h3', null, '结果体'));
       const pre = el('pre', 'json', JSON.stringify(c.result, null, 2));
       wrap.appendChild(pre);
+    }
+
+    // 第7周：按需环境快照 —— 图像本体 + 采集时刻（服务端接收为权威，设备声称作参考）。
+    if (c.op === 'image' && c.result && c.result.image_id != null) {
+      const r = c.result;
+      wrap.appendChild(el('h3', null, '环境快照（本次 request_id=' + c.request_id + '）'));
+      const img = el('img', 'snap');
+      img.src = api('/api/v1/snapshots/' + r.image_id + '/image?ts=' + r.captured_at_ms);
+      img.alt = '环境快照 ' + c.request_id;
+      img.style.maxWidth = '320px'; img.style.maxHeight = '240px';
+      img.style.border = '1px solid var(--line)'; img.style.display = 'block';
+      wrap.appendChild(img);
+      const kv2 = el('div', 'kv');
+      const add2 = (k, v) => { kv2.appendChild(el('div', 'k', k));
+                                kv2.appendChild(el('div', 'v', v === null || v === undefined ? '—' : String(v))); };
+      add2('采集时刻', fmtTime(r.captured_at_ms) + '（服务端接收，权威）'
+           + (r.t_captured_ms ? '；设备声称 ' + fmtTime(r.t_captured_ms) : ''));
+      add2('图像来源', r.source === 'replay'
+           ? '回放（获授权历史图像，非本次实拍）' : '实拍（camera）');
+      add2('图像摘要', (r.n_bytes != null ? r.n_bytes + ' 字节 · ' : '')
+           + 'sha256 ' + String(r.sha256 || '').slice(0, 16));
+      wrap.appendChild(kv2);
     }
 
     if (samples) {

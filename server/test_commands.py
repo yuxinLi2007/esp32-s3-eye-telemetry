@@ -295,9 +295,11 @@ def test_create_requires_control_token(client, monkeypatch):
 
 def test_ops_catalog_is_single_source_for_frontend(client):
     body = client.get("/api/v1/commands/ops").json()
-    assert {o["op"] for o in body["ops"]} == {"ping", "selftest", "capture"}
+    assert {o["op"] for o in body["ops"]} == {"ping", "selftest", "capture", "image"}
     cap = [o for o in body["ops"] if o["op"] == "capture"][0]
     assert {p["name"] for p in cap["params"]} == {"n", "interval_ms"}
+    img = [o for o in body["ops"] if o["op"] == "image"][0]     # 第7周：按需快照无参数
+    assert img["params"] == []
     assert body["max_capture_duration_ms"] == commands.MAX_CAPTURE_DURATION_MS
     assert body["max_live_per_device"] == commands.MAX_LIVE_PER_DEVICE
 

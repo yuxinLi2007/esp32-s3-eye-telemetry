@@ -182,6 +182,7 @@
       });
       if (!r.ok) throw new Error(await readError(r));
       renderInfer(ib, (await r.json()).inference);
+      checkAsk(sid);                    // 分析结果若触发主动询问，立即亮横幅
     } catch (e) {
       ib.textContent = '识别失败：' + String(e && e.message || e);
     }
@@ -243,6 +244,42 @@
       await refresh(true);
     } catch (e) {
       note('重拍失败：' + String(e && e.message || e), true);
+    }
+  }
+
+  // ------------------------------------------------------------ 第9周：主动询问
+  async function checkAsk(sid) {
+    // 该画面有未表态的"要重拍吗"询问 → 亮出横幅（新 id snap_ask_box）
+    try {
+      const r = await fetch(api('/api/v1/asks?pending=1'), { cache: 'no-store' });
+      if (!r.ok) return;
+      const j = await r.json();
+      const a = (j.asks || []).find(x => x.snapshot_id === sid && x.state === 'open');
+      const box = $('snap_ask_box');
+      if (box) box.style.display = a ? '' : 'none';
+    } catch (e) { /* 横幅是增强，不因它报错 */ }
+  }
+
+  async function decideAsk(sid, decision) {
+    // confirm → 服务端立即下发重拍指令（同设备新 request_id）；ignore → 冷却期不打扰
+    try {
+      const r = await ctlFetch('/api/v1/snapshots/' + sid + '/ask', {
+        method: 'POST',
+        body: JSON.stringify({ decision }),
+      });
+      if (!r.ok) throw new Error(await readError(r));
+      const j = await r.json();
+      if (decision === 'confirm' && j.recapture) {
+        note('已确认重拍：' + j.recapture.request_id + '　' +
+             (j.recapture.state_text || ''), false);
+      } else {
+        note('已忽略：本轮不再打扰（冷却期内同类画面不重复询问）', false);
+      }
+      const box = $('snap_ask_box');
+      if (box) box.style.display = 'none';
+      await refresh(true);
+    } catch (e) {
+      note('询问处理失败：' + String(e && e.message || e), true);
     }
   }
 
@@ -501,6 +538,23 @@
       corrRow.appendChild(recap);
       box2.appendChild(corrRow);
       wrap.appendChild(box2);
+
+      // 第9周：主动询问 —— 画面不可用时问"要重拍吗"，确认/忽略 + 冷却。
+      // 横幅在渲染后轮询一次 GET /asks（可在任意时机打开过的询问里出现）。
+      const askBox = el('div', 'snap-ask');
+      askBox.id = 'snap_ask_box';
+      askBox.style.display = 'none';
+      askBox.appendChild(el('span', null, '画面可能不可用，要重拍一张吗？'));
+      const askYes = el('button', 'mini', '重拍（确认）');
+      askYes.id = 'snap_ask_yes';
+      askYes.onclick = () => decideAsk(r.image_id, 'confirm');
+      const askNo = el('button', 'mini', '不用（忽略）');
+      askNo.id = 'snap_ask_no';
+      askNo.onclick = () => decideAsk(r.image_id, 'ignore');
+      askBox.appendChild(askYes);
+      askBox.appendChild(askNo);
+      wrap.appendChild(askBox);
+      checkAsk(r.image_id);          // 异步：该画面有未表态询问就亮横幅
     }
 
     if (samples) {

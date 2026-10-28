@@ -511,6 +511,41 @@ LLM_API_KEY / LLM_MODEL` 配置）只服务意图解析，解析失败/超时/�
   `VISION_TIMEOUT_MS` / `VISION_LOW_SCORE`；回放演示参数 `VISION_REPLAY_SCORE` /
   `VISION_REPLAY_LABEL`（详见 `server/.env.example`）。
 
+### 视觉事件触发一次主动询问（第9周）
+
+> 中期可运行原型：第 5~9 周功能合并即"语音/视觉/实体协同"的中期形态。
+
+| 方法 | 路径 | 鉴权 | 作用 |
+|---|---|---|---|
+| POST | `/api/v1/snapshots/{id}/ask` | `X-Control-Token` | 用户对"要重拍吗？"表态：`confirm` → 立即下发重拍指令；`ignore` → 关闭询问并进入冷却 |
+| GET | `/api/v1/asks?pending=1` | 匿名 | 未表态的主动询问（前端横幅轮询；连快照元数据） |
+| POST | `/api/v1/snapshots/{id}/analyze` | `X-Control-Token` | 分析完成后**自动**按事件触发开询问（响应带 `ask` 或 `ask_note` 原因） |
+
+- **事件触发与反馈优先级（一次说清）**：画面不可用（遮挡/模糊/未知/拒识/低分，
+  判定在 `vision.usable()` 一处，用户纠正优先）且**设备空闲**（无
+  pending/claimed/running 指令）且**同一画面没问过**且**不在冷却期**，才发起询问
+  ——见 `vision.ask_eligibility` 的四条条件，是"不打断任务、不反复打扰"的落点。
+- **尊重用户选择**：`confirm` 走既有 image 指令通道重拍（新 request_id = 新图，
+  旧图不冒充）；`ignore` 关闭询问并启动冷却 `VISION_ASK_COOLDOWN_MS`
+  （默认 300000ms = 5 分钟）——冷却期内任何新画面都不再自动询问。
+- **误判能够纠正**：把画面纠正为"可用"时，未表态的询问立即作废（`superseded`），
+  状态回答不再追问；纠正为不可用则按不可用对待（可再次成为询问对象）。
+- **三处一致的询问入口**：分析响应自带问句（语音助手"图像采集完成…要重拍一张吗？"）、
+  `GET /asks` 驱动界面横幅（新 id `snap_ask_box`，按钮 `snap_ask_yes/no`）、
+  快照详情带 ask 状态。
+- **语音意图**：`ask_ignore`（"忽略/不重拍/不用重拍"）与取消词刻意分开
+  ——取消停的是任务，忽略停的是"别再问了"；同帧级鉴权（CONTROL_TOKEN）。
+- **提交与迁移**：首轮完整任务测试原始记录见 `server/docs/week9-test-record.md`
+  （现场 demo 逐行输出，18 项当堂验证全过）；问题归因与修复清单（模型/端侧/
+  交互三类）与**期末迁移模块决定**见 `server/docs/week9-attribution.md`。
+  迁移模块 = "按需环境快照 + 主动重拍询问"交互闭环，验证任务即当堂验证两条 + S1/S2。
+- **迁移规则（第8周 → 第9周）——"询问不改采集语义"**：active 任务、终态守卫、
+  冷却与去重都不改变图像指令通道本身；重拍永远是新 request_id 的新图，判定的
+  只是"要不要重拍"。状态回答里主动询问是"追加"在既有"图像采集完成"句子上，
+  不改变状态回答的既有语义。
+- **演示**：`python tools/demo_week9.py --origin http://127.0.0.1:8001`
+  （S1 事件闭环 / S2 拒绝冷却 / S3 误判纠正 / S4 反馈优先级 / S5 运行位置清单）。
+
 ### 数据契约
 
 #### `POST /api/v1/ingest` → 201，请求头 `X-Ingest-Token`

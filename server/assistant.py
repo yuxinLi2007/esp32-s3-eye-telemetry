@@ -36,6 +36,7 @@ import httpx
 import commands
 import db
 import task_context
+import vision
 
 # 查询结果"新鲜"的门槛：超过这个时间就不再当作当前状态
 QUERY_STALE_MS = 60_000
@@ -71,6 +72,17 @@ IMAGE_WORDS = (
     "看看环境", "查看环境", "看下环境", "看环境",
     "查看画面", "看看画面", "看下画面",
     "环境图像", "环境的图像", "环境快照",
+)
+# 第8周：重新采集 —— 对刚才那张画面补拍一张（走同一 image 指令通道）。
+# "重拍/再拍一张"比"拍一张"更具体：语义都是取一张新图，但回答要交代"重拍"。
+RECAPTURE_WORDS = (
+    "重拍", "重新拍", "再拍一张", "重拍一张", "再拍一次", "重新拍一张",
+    "拍一张新的", "重新拍一张",
+)
+# 第8周：识别结果 —— 读最新一次推理（标签/分数/拒识/来源），只读、不新发指令。
+IMAGE_RESULT_WORDS = (
+    "识别结果", "识别一下", "识别下", "看到了什么", "画面怎么样", "画面如何",
+    "这张图", "遮挡吗", "能不能看清", "能看清吗", "画面识别", "是什么场景",
 )
 
 TRUST_TEXT = {
@@ -108,8 +120,13 @@ def _keyword_action(text):
     has_collect = any(w in text for w in COLLECT_WORDS)
     has_query = any(w in text for w in QUERY_WORDS)
     has_image = any(w in text for w in IMAGE_WORDS)
-    if (has_collect and has_query) or (has_collect and has_image):
+    has_recapture = any(w in text for w in RECAPTURE_WORDS)
+    if (has_collect and has_query) or (has_collect and has_image) \
+            or (has_collect and has_recapture):
         return "mixed"
+    if has_recapture:
+        # "重拍/再拍一张"比"拍一张"更具体：同一 image 指令通道，但回答交代重拍
+        return "recapture"
     if has_image:
         # 图像词优先于通用查询词："看看环境"是拍照，不是"查看数据"。
         # collect 与 image 同可能是"拜托再来一次"语感，交给人澄清。
@@ -204,7 +221,8 @@ def _ask_llm(text):
 # ---------------------------------------------------------------- 意图解析
 def parse_intent(text, devices):
     """返回 {action, device_mac, params, reason}。
-    action ∈ query / collect / image / cancel / clarify / refuse / status。
+    action ∈ query / collect / image / recapture / image_result
+             / cancel / clarify / refuse / status。
     """
     t = (text or "").strip()
     if not t:
@@ -215,6 +233,11 @@ def parse_intent(text, devices):
     if any(w in t for w in STATUS_WORDS):
         return {"action": "status", "device_mac": None, "params": {},
                 "reason": "Status query — 只读"}
+
+    # 第8周：识别结果 —— 只读最新推理（标签/分数/拒识/来源），不新发指令
+    if any(w in t for w in IMAGE_RESULT_WORDS):
+        return {"action": "image_result", "device_mac": None, "params": {},
+                "reason": "Inference query — 只读"}
 
     try:
         llm = _ask_llm(t)
@@ -262,27 +285,18 @@ def parse_intent(text, devices):
         return {"action": action, "device_mac": device, "params": params,
                 "reason": "ok"}
 
-    if action == "collect":
+    if action in ("collect", "image", "recapture"):
+        # 请求采集 / 拍照 / 重拍都要落到某台设备上（同一设备范围与澄清口径）
         if not devices:
+            verb = {"collect": "请求采集", "image": "请求拍照",
+                    "recapture": "请求重拍"}[action]
             return {"action": "refuse", "device_mac": None, "params": {},
-                    "reason": "本系统还没有见过任何设备上报数据，无法请求采集。"}
+                    "reason": "本系统还没有见过任何设备上报数据，无法%s。" % verb}
         if len(devices) > 1:
             return {"action": "clarify", "device_mac": None, "params": params,
                     "reason": "检测到多台已知设备：%s；请说明针对哪一台。"
                               % "、".join(sorted(devices))}
         return {"action": action, "device_mac": devices[0], "params": params,
-                "reason": "ok"}
-
-    if action == "image":
-        # 拍照也要落到某台设备上（复用和第 4 周采集一样的设备范围与澄清口径）
-        if not devices:
-            return {"action": "refuse", "device_mac": None, "params": {},
-                    "reason": "本系统还没有见过任何设备，无法请求拍照。"}
-        if len(devices) > 1:
-            return {"action": "clarify", "device_mac": None, "params": {},
-                    "reason": "检测到多台已知设备：%s；请说明要对哪一台拍照。"
-                              % "、".join(sorted(devices))}
-        return {"action": action, "device_mac": devices[0], "params": {},
                 "reason": "ok"}
 
     # query：没指定设备也没关系，就答全系统最近的数据
@@ -403,6 +417,65 @@ def image_answer(conn, text, intent):
             "拿到画面会连同采集时刻一起显示，稍候。"
             % (rid, cmd["ttl_ms"] // 1000)
         )
+    return {"intent": intent, "answer": answer, "command": cmd, "error_code": None}
+
+
+def image_result_answer(conn):
+    """第8周：回答"看到了什么 + 还有什么不能确定"（只读，不新发指令）。
+
+    读的是"图像 → 推理结果"里的最新一条；答句由 vision.human_line 输出，
+    其中固定的两句话就是本周验收口径：来源标注（回放不冒充实拍）、
+    "分数未校准，不代表现实正确率"。
+    """
+    row = conn.execute(
+        """SELECT i.*, s.t_server_recv_ms AS captured_ms
+           FROM inferences i
+           LEFT JOIN snapshots s ON s.id = i.snapshot_id
+           ORDER BY i.t_server_ms DESC, i.id DESC LIMIT 1"""
+    ).fetchone()
+    if row is None:
+        return ("还没有任何图像识别结果。可以先说说“拍张照”获取画面，"
+                "再问“识别结果”。")
+    inf = dict(row)
+    eff, _st = vision.effective_label(conn, inf["snapshot_id"])
+    return vision.human_line(inf, corrected=(eff if _st == "corrected" else None),
+                             captured_ms=inf.get("captured_ms"))
+
+
+def recapture_answer(conn, text, intent):
+    """第8周：重新采集 —— 对同一台设备再发一条 image 指令（补拍一张）。
+
+    复用 image 指令通道与终态守卫：新请求 = 新 request_id = 新图，
+    上次成功图像永远不可能被标为这次重拍的结果。
+    """
+    snap = conn.execute(
+        "SELECT * FROM snapshots ORDER BY t_server_recv_ms DESC, id DESC LIMIT 1"
+    ).fetchone()
+    mac = intent.get("device_mac")
+    if snap is not None and snap["device_mac"]:
+        mac = snap["device_mac"]           # 重拍默认对"刚才那张图"的设备
+    if not mac:
+        return {"intent": intent, "answer": "还没有可重拍的画面。",
+                "command": None, "error_code": None}
+    token = "ast-" + secrets.token_hex(8)
+    try:
+        row, deduped = commands.create(conn, device_mac=mac, op="image",
+                                       params={}, client_token=token,
+                                       note="assistant recapture: " + text[:120],
+                                       created_by="assistant")
+    except commands.CommandError as exc:
+        return {"intent": intent, "answer": "下发失败：%s" % exc.message,
+                "command": None, "error_code": exc.code}
+    cmd = commands.to_dict(row, now=commands.now_ms(),
+                           events=commands.events_of(conn, row["request_id"]))
+    rid = cmd["request_id"]
+    if deduped:
+        answer = "重拍请求刚提交过，未重复下发：仍是指令 %s（%s）。" % (
+            rid, cmd["state_text"])
+    else:
+        answer = ("已受理：重拍指令 %s 已下发（设备 %s，最迟约 %d 秒领取）。"
+                  "新画面会带上新的采集时刻，不会和上一张混在一起。"
+                  % (rid, mac, cmd["ttl_ms"] // 1000))
     return {"intent": intent, "answer": answer, "command": cmd, "error_code": None}
 
 
@@ -581,6 +654,18 @@ def _execute(conn, text, intent, devices, ctx, t0):
             task_context.set_active(ctx_id, rid, "image",
                                     out["command"].get("t_created_ms") or t0)
             task_context.log_event(ctx_id, "image_issued", rid)
+        return intent, out["answer"], out["command"], out["error_code"]
+
+    if action == "image_result":
+        return intent, image_result_answer(conn), None, None
+
+    if action == "recapture":
+        out = recapture_answer(conn, text, intent)
+        if ctx_id is not None and out.get("command"):
+            rid = out["command"]["request_id"]
+            task_context.set_active(ctx_id, rid, "image",
+                                    out["command"].get("t_created_ms") or t0)
+            task_context.log_event(ctx_id, "recapture_issued", rid)
         return intent, out["answer"], out["command"], out["error_code"]
 
     return intent, "无法理解这条请求，请换种说法。", None, None

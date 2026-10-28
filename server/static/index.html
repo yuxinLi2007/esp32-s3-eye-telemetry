@@ -82,6 +82,27 @@
          border-radius:6px; padding:6px 8px; font-size:11px; display:none; z-index:5;
          white-space:pre; }
 
+  /* ---- 第4周：自然语言助手 ---- */
+  .nl-row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  .nl-row input[type=text] { width:auto; flex:1 1 420px; min-width:240px; padding:7px 10px; }
+  .nl-row select { flex:0 0 auto; }
+  .nl-answer { margin-top:10px; padding:10px 12px; border-radius:8px;
+               border:1px solid var(--line); background:#0d1116; white-space:pre-wrap; }
+  .nl-answer.ok  { border-color:var(--ok); }
+  .nl-answer.bad { border-color:var(--warn); }
+  .nl-answer.err { border-color:var(--crit); }
+  .nl-meta { color:var(--dim); font-size:11px; margin-top:8px; }
+  .nl-chip { display:inline-block; padding:1px 7px; border-radius:10px; font-size:11px;
+             background:#0d2137; color:#79c0ff; margin-right:6px; }
+  .nl-chip.write { background:#3a2d08; color:#f0c674; }
+  .nl-chip.read  { background:#0d2a17; color:#7ee787; }
+  .nl-chip.err   { background:#4a1512; color:#ff9d97; }
+  .nl-json { margin-top:8px; max-height:260px; overflow:auto; background:#0d1116;
+             border:1px solid var(--line); border-radius:8px; padding:8px;
+             font-size:11px; color:var(--dim); white-space:pre; }
+  .nl-examples button { margin:0 6px 6px 0; }
+  .nl-table td, .nl-table th { text-align:left; }
+
   /* ---- 第2周：远程指令面板 ---- */
   .cmdrow { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:8px; }
   .cmdrow label { color:var(--dim); }
@@ -135,6 +156,32 @@
   <section>
     <h3>数据来源（最近一批）</h3>
     <div class="prov" id="prov"></div>
+  </section>
+
+  <section>
+    <h3>自然语言助手（第4周）</h3>
+    <div class="prov">
+      <div class="nl-row">
+        <input type="text" id="nl_text" maxlength="500" spellcheck="false"
+               placeholder="用一句话说，例如：帮我看看上次的数据 / 重新采集 40 次，间隔 50 毫秒">
+        <select id="nl_engine" title="意图翻译引擎">
+          <option value="auto" selected>自动（有模型用模型，否则规则）</option>
+          <option value="rules">规则（离线，不联网）</option>
+          <option value="llm">大模型（失败也降级）</option>
+        </select>
+        <button class="btn op" id="nl_ask">发送</button>
+      </div>
+      <div class="nl-row" style="margin-top:8px">
+        <label>目标设备</label>
+        <input type="text" id="nl_mac" spellcheck="false" placeholder="留空 = 唯一已知设备">
+        <label>最长等待</label>
+        <input type="number" id="nl_wait" value="12" min="0" max="120" step="1" style="width:70px">
+        <span class="note">秒（仅"重新采集"用；到了还没回就如实报，不伪造新数据）</span>
+      </div>
+      <div class="nl-examples" id="nl_examples" style="margin-top:10px"></div>
+      <div class="note" id="nl_engine_note"></div>
+      <div id="nl_out"></div>
+    </div>
   </section>
 
   <section>
@@ -847,5 +894,6 @@ window.DASH = {
 </script>
 <script src="commands.js"></script>
 <script src="button.js"></script>
+<script src="assistant.js"></script>
 </body>
 </html>

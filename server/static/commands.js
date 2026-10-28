@@ -164,6 +164,88 @@
     }
   }
 
+  // ------------------------------------------------------------ 第8周：视觉识别与反馈
+  // 标签 → 人话（界面显示用；"分数未校准"的口径在 renderInfer 里固定出现）
+  function labText(l) {
+    return { usable: '可用', occluded: '遮挡', blurred: '模糊',
+             unknown: '未知' }[l] || l;
+  }
+
+  async function analyzeSnap(sid, task) {
+    const ib = $('snap_infer_box');
+    if (!ib) return;
+    ib.textContent = '正在分析（未配置真实模型时按"回放"处理，会在结果里标注）…';
+    try {
+      const r = await ctlFetch('/api/v1/snapshots/' + sid + '/analyze', {
+        method: 'POST',
+        body: JSON.stringify({ task: task || 'usability' }),
+      });
+      if (!r.ok) throw new Error(await readError(r));
+      renderInfer(ib, (await r.json()).inference);
+    } catch (e) {
+      ib.textContent = '识别失败：' + String(e && e.message || e);
+    }
+  }
+
+  function renderInfer(ib, inf) {
+    ib.innerHTML = '';
+    if (!inf) { ib.textContent = '没有推理结果。'; return; }
+    const kv = el('div', 'kv');
+    const add = (k, v) => { kv.appendChild(el('div', 'k', k));
+                            kv.appendChild(el('div', 'v', v === null || v === undefined ? '—' : String(v))); };
+    if (inf.status === 'error') {
+      add('识别状态', '失败（' + inf.error_code + '）');
+      add('错误信息', inf.error_message);
+      ib.appendChild(kv);
+      return;
+    }
+    add('识别状态', inf.status === 'rejected' ? '拒识（模型无法判断）' : '有结果');
+    add('标签', labText(inf.label) + '（' + inf.label + '）');
+    add('分数', inf.score === null ? '—'
+        : inf.score.toFixed(2) + '　未校准（模型置信度，不是现实正确率）');
+    add('模型版本', inf.model_version);
+    add('推理来源', inf.source === 'model'
+        ? '真实模型推理' : '回放标注（非真实推理，仅界面演示）');
+    add('分析时刻', fmtTime(inf.t_server_ms) + '（服务端时间）');
+    ib.appendChild(kv);
+    if (inf.score !== null && inf.score < 0.45) {
+      ib.appendChild(el('div', 'note', '分数偏低，结果不太确定：可点下方"重拍一张"补拍。'));
+    }
+  }
+
+  async function correctSnap(sid, value) {
+    try {
+      const r = await ctlFetch('/api/v1/snapshots/' + sid + '/corrections', {
+        method: 'POST',
+        body: JSON.stringify({ kind: 'label', value, note: 'ui 人工纠正' }),
+      });
+      if (!r.ok) throw new Error(await readError(r));
+      const ib = $('snap_infer_box');
+      if (ib && ib.childNodes.length) {
+        ib.appendChild(el('div', 'note',
+          '已记录纠正：该画面现在按你的判断显示为 "'
+          + labText(value) + '（' + value + '）"。'));
+      }
+      await refresh(true);
+    } catch (e) {
+      note('纠正失败：' + String(e && e.message || e), true);
+    }
+  }
+
+  async function recaptureSnap(sid) {
+    try {
+      const r = await ctlFetch('/api/v1/snapshots/' + sid + '/recapture', {
+        method: 'POST', body: '{}',
+      });
+      if (!r.ok) throw new Error(await readError(r));
+      const j = await r.json();
+      note('已重拍：' + j.command.request_id + '　' + j.command.state_text, false);
+      await refresh(true);
+    } catch (e) {
+      note('重拍失败：' + String(e && e.message || e), true);
+    }
+  }
+
   async function showDetail(rid) {
     selected = (selected === rid) ? null : rid;
     detail = null; samples = null;
@@ -392,6 +474,33 @@
       add2('图像摘要', (r.n_bytes != null ? r.n_bytes + ' 字节 · ' : '')
            + 'sha256 ' + String(r.sha256 || '').slice(0, 16));
       wrap.appendChild(kv2);
+
+      // 第8周：视觉识别 —— "看到了什么 + 还有什么不能确定"的可理解反馈。
+      // 标签/分数/拒识/模型版本/来源结构化展示；纠正按钮是纠错入口，
+      // 重拍按钮复用 image 指令通道补拍一张（新 request_id，旧图绝不冒充）。
+      const h3 = el('h3', null, '视觉识别（第8周：标签+分数，未校准）');
+      wrap.appendChild(h3);
+      const box2 = el('div', 'snap-analyze');
+      const btnRun = el('button', 'btn', '识别画面（可用性）');
+      btnRun.id = 'snap_analyze_btn';
+      btnRun.onclick = () => analyzeSnap(r.image_id, 'usability');
+      box2.appendChild(btnRun);
+      const inferBox = el('div', 'snap-infer');
+      inferBox.id = 'snap_infer_box';
+      inferBox.textContent = '尚未分析。点击"识别画面"：未配置真实模型时按回放处理并标注。';
+      box2.appendChild(inferBox);
+      const corrRow = el('div', 'snap-corr');
+      for (const lab of ['usable', 'occluded', 'blurred', 'unknown']) {
+        const b = el('button', 'mini', '纠正为' + labText(lab));
+        b.onclick = () => correctSnap(r.image_id, lab);
+        corrRow.appendChild(b);
+      }
+      const recap = el('button', 'mini', '重拍一张');
+      recap.id = 'snap_recapture_btn';
+      recap.onclick = () => recaptureSnap(r.image_id);
+      corrRow.appendChild(recap);
+      box2.appendChild(corrRow);
+      wrap.appendChild(box2);
     }
 
     if (samples) {

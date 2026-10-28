@@ -471,6 +471,46 @@ LLM_API_KEY / LLM_MODEL` 配置）只服务意图解析，解析失败/超时/�
   `python tools/demo_week7.py --origin http://127.0.0.1:8001`（23 项真实 HTTP 当堂验证）。
 - **环境变量**（均有默认值，可选）：`SNAPSHOT_DIR` / `SNAPSHOT_KEEP_MAX` / `SNAPSHOT_KEEP_MS`。
 
+### 视觉推理与可理解反馈（第8周）
+
+| 方法 | 路径 | 鉴权 | 作用 |
+|---|---|---|---|
+| POST | `/api/v1/snapshots/{id}/analyze` | `X-Control-Token` | 对一张已采集图像做推理（结构化解析，幂等；`force` 重跑；未配置真实模型时返回"回放"标注结果） |
+| POST | `/api/v1/snapshots/{id}/corrections` | `X-Control-Token` | 人工纠正入口（`kind=label, value=…`；纠正覆盖模型推断展示，留痕可查） |
+| POST | `/api/v1/snapshots/{id}/recapture` | `X-Control-Token` | 重新采集：同一台设备再发一条 image 指令（新 request_id = 新图） |
+| GET | `/api/v1/snapshots/{id}` | 匿名 | 单张图像详情：元数据 + 推理结果 + 纠正记录（只读） |
+| GET | `/api/v1/inferences` | 匿名 | 推理审计流（可 `?request_id=` 过滤；图像被最少保留清理后仍可反查） |
+
+- **结构化结果解析**：模型输出必须是 `{task, label, score 0..1, rejected,
+  model_version}` 且逐项校验；非法 / 越界 / 缺字段 → `status=error` +
+  明确错误码（`bad_model_response` / `model_unavailable` 等），不静默吞掉、
+  不编造数值。
+- **分数未校准口径（当堂验证 1）**：score 是模型置信度，**不是现实正确率**。
+  任何界面与自然语言答复都固定带"未校准，不代表现实正确率"；低于
+  `VISION_LOW_SCORE` 视为低分/不确定，如实说并建议重拍。
+- **场景类别边界（当堂验证 2）**：`task=scene` 只回答"画面像什么场景"，
+  答复固定声明"不代表精确位置，也不构成任何安全结论"，不派生出位置/安全判断。
+- **回放路径（备用）**：未配置 `VISION_BASE_URL` 时推理标记 `source=replay` +
+  `playback=true`，界面与答复都标"回放标注"，**不计入真实推理证据**；
+  接上教师真实基线（`VISION_BASE_URL` 等环境变量）即走真实模型路径。
+- **人工纠正与重拍（后 2 学时）**：纠正记录进 `corrections` 表（连带
+  inference_id），随第 9 周"误判可纠正"、第 12 周"偏好"复用；"重拍"走
+  既有 image 指令通道——新请求 = 新 request_id = 新图，上次成功图像不可能
+  被标为本次重拍的结果。
+- **输入-结果-反馈对应**：inferences 行复制快照的 request_id 与采集时刻，
+  即使图像本体因"最少保留"被清，`GET /api/v1/inferences?request_id=` 仍可
+  反查"哪次请求 → 什么结果 → 谁纠正过"。
+- **样例对照（提交项）**：正常 / 低分 / 错误（模型误判经人工纠正）/ 未知（拒识）
+  四类样例对照见 `server/docs/week8-samples.md`；`python tools/demo_week8.py`
+  现场跑通正常、纠正、重拍闭环与对照表。
+- **迁移规则（第7周 → 第8周）——"识别反馈不改变采集语义"**：图像采集通道
+  （request_id / 最少保留 / 终态守卫）**原样不动**；重拍复用 image 指令而不是
+  新造一种"重拍指令"，因此第 6 周取消/迟到隔离口径自动适用于重拍。模型推断
+  与真人反馈分开存储（inferences ≠ corrections），推断永远不冒充纠正后的结论。
+- **环境变量**：`VISION_BASE_URL` / `VISION_API_KEY` / `VISION_MODEL` /
+  `VISION_TIMEOUT_MS` / `VISION_LOW_SCORE`；回放演示参数 `VISION_REPLAY_SCORE` /
+  `VISION_REPLAY_LABEL`（详见 `server/.env.example`）。
+
 ### 数据契约
 
 #### `POST /api/v1/ingest` → 201，请求头 `X-Ingest-Token`

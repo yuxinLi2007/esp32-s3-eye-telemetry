@@ -22,6 +22,7 @@ import commands
 import db
 import snapshots
 import task_context
+import vision
 import voice
 
 DB_PATH = os.environ.get(
@@ -44,6 +45,7 @@ async def lifespan(_app):
     conn = db.init_db(DB_PATH)
     commands.init_schema(conn)
     snapshots.ensure_schema(conn)
+    vision.ensure_schema(conn)
     conn.close()
     if not INGEST_TOKEN:
         print(
@@ -317,6 +319,15 @@ async def snapshot_error_handler(_request: Request, exc: snapshots.SnapshotError
     )
 
 
+@app.exception_handler(vision.VisionError)
+async def vision_error_handler(_request: Request, exc: vision.VisionError):
+    """视觉链路（第8周）的错误出口，shape 同上：code + message。"""
+    return JSONResponse(
+        status_code=exc.http_status,
+        content={"ok": False, "error": {"code": exc.code, "message": exc.message}},
+    )
+
+
 class CommandCreate(BaseModel):
     device_mac: str
     op: str
@@ -523,6 +534,115 @@ def snapshot_image(snapshot_id: int, conn=Depends(get_conn)):
                              "X-Captured-At-Ms": str(row["t_server_recv_ms"])})
 
 
+# ============================================================ 第8周：视觉推理与反馈
+#
+# 模型返回"标签 + 分数 + 拒识 + 模型版本"，系统把它们变成可理解反馈：
+#   - analyze     —— 对一张已采集图像做推理（结构化解析，幂等；未配置模型走"回放"标注）；
+#   - corrections —— 人工纠正入口（纠正值覆盖模型推断展示，供第9周"误判可纠正"复用）；
+#   - recapture   —— 重新采集（复用 image 指令通道，同设备补拍一张）。
+# 鉴权口径：三者都"写状态或改设备行为"，与 cancel/image 同级，要求 CONTROL_TOKEN。
+# 只读的识别结果查询（GET /snapshots/{id}、GET /inferences）匿名可用，与 query 同级。
+
+
+class AnalyzeIn(BaseModel):
+    task: str = Field(default="usability", max_length=32)
+    force: bool = False
+
+
+@app.post("/api/v1/snapshots/{snapshot_id}/analyze",
+          dependencies=[Depends(require_control_token)])
+def snapshot_analyze(snapshot_id: int, payload: AnalyzeIn, conn=Depends(get_conn)):
+    snap = snapshots.get(conn, snapshot_id)
+    if snap is None:
+        raise HTTPException(status_code=404,
+                            detail={"code": "snapshot_not_found",
+                                    "message": "图像记录不存在（可能已被最少保留策略清理）"})
+    inf = vision.analyze_snapshot(conn, snap, task=payload.task or "usability",
+                                  force=payload.force)
+    return {"ok": True, "snapshot_id": snapshot_id, "inference": inf}
+
+
+class CorrectionIn(BaseModel):
+    kind: str = Field(default="label", max_length=16)
+    value: str = Field(min_length=1, max_length=32)
+    note: str | None = Field(default=None, max_length=200)
+
+
+@app.post("/api/v1/snapshots/{snapshot_id}/corrections",
+          dependencies=[Depends(require_control_token)])
+def snapshot_correct(snapshot_id: int, payload: CorrectionIn, conn=Depends(get_conn)):
+    snap = snapshots.get(conn, snapshot_id)
+    if snap is None:
+        raise HTTPException(status_code=404,
+                            detail={"code": "snapshot_not_found",
+                                    "message": "图像记录不存在"})
+    row = vision.add_correction(conn, snap, kind=payload.kind,
+                                value=payload.value, note=payload.note)
+    out = dict(row)
+    out["effective"] = vision.effective_label(conn, snapshot_id)[0]
+    return {"ok": True, "correction": out}
+
+
+@app.post("/api/v1/snapshots/{snapshot_id}/recapture",
+          dependencies=[Depends(require_control_token)])
+def snapshot_recapture(snapshot_id: int, request: Request, conn=Depends(get_conn)):
+    """重新采集：同样的设备、同样的 image 指令通道，再拍一张（新 request_id）。"""
+    snap = snapshots.get(conn, snapshot_id)
+    if snap is None:
+        raise HTTPException(status_code=404,
+                            detail={"code": "snapshot_not_found",
+                                    "message": "图像记录不存在"})
+    mac = snap["device_mac"]
+    if not mac:
+        raise HTTPException(status_code=400,
+                            detail={"code": "no_device",
+                                    "message": "该图像没有关联设备，无法重拍"})
+    token = "ui-" + secrets.token_hex(8)
+    row, deduped = commands.create(conn, device_mac=mac, op="image", params={},
+                                   client_token=token,
+                                   note="recapture of snapshot %d" % snapshot_id,
+                                   created_by="ui")
+    body = commands.to_dict(row, commands.now_ms(),
+                            commands.events_of(conn, row["request_id"]))
+    return JSONResponse(
+        status_code=200 if deduped else 201,
+        content={"ok": True, "deduped": deduped, "command": body},
+    )
+
+
+@app.get("/api/v1/snapshots/{snapshot_id}")
+def snapshot_detail(snapshot_id: int,
+                    task: str = Query(default="usability", max_length=32),
+                    conn=Depends(get_conn)):
+    """单张图像详情：元数据 + 推理结果 + 人工纠正（第8周，匿名只读）。"""
+    snap = snapshots.get(conn, snapshot_id)
+    if snap is None:
+        raise HTTPException(status_code=404,
+                            detail={"code": "snapshot_not_found",
+                                    "message": "图像记录不存在（可能已被最少保留策略清理）"})
+    inf = vision.get(conn, snapshot_id, task)
+    return {
+        "ok": True,
+        "snapshot": snapshots._meta(snap),
+        "inference": vision._view(inf) if inf else None,
+        "corrections": [dict(c) for c in vision.corrections_of(conn, snapshot_id)],
+        "effective": vision.effective_label(conn, snapshot_id),
+    }
+
+
+@app.get("/api/v1/inferences")
+def inferences_list(
+    limit: int = Query(default=50, ge=1, le=200),
+    request_id: str | None = Query(default=None, description="只看某条图像指令的推理"),
+    conn=Depends(get_conn),
+):
+    """推理审计流（匿名只读）。即使图像本体被最少保留清理，
+    请求(request_id)-结果(inference)-反馈(corrections)的对应关系仍可反查。"""
+    rows = vision.list_inferences(conn, limit=limit, request_id=request_id)
+    return {"ok": True, "count": len(rows),
+            "inferences": [vision._view(r) for r in rows]}
+
+
 # ============================================================ 第4周：自然语言入口
 #
 # 查询与请求采集分离：query 只读已有记录；collect 走 commands.create（改设备行为），
@@ -545,8 +665,9 @@ def assistant_chat(payload: ChatIn, request: Request, conn=Depends(get_conn)):
                     "message": "context_id 格式非法"},
         )
     result = assistant.chat(conn, payload.text, context_id=payload.context_id)
-    # collect / image（改设备行为）与 cancel（改指令状态）都是会改变状态的，同级别鉴权。
-    if result["intent"]["action"] in ("collect", "cancel", "image"):
+    # collect / image / recapture（改设备行为）与 cancel（改指令状态）都是会改变状态的，
+    # 同级别鉴权。
+    if result["intent"]["action"] in ("collect", "cancel", "image", "recapture"):
         require_control_token(request)
     return {
         "ok": True,

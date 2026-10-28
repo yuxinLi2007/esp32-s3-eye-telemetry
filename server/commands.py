@@ -22,6 +22,8 @@ import sqlite3
 import threading
 import time
 
+import snapshots
+
 # ---------------------------------------------------------------- 状态机
 PENDING = "pending"      # 已下发，等设备来领
 CLAIMED = "claimed"      # 设备已领取，尚未开始/尚未上报进度
@@ -96,6 +98,13 @@ OPS = {
         "ttl_ms": 30_000,
         "timeout_ms": 20_000,
         "desc": "立即采集：按给定间隔真实读取传感器 N 次，样本带 request_id 入库",
+    },
+    "image": {
+        "params": {},
+        "ttl_ms": 60_000,
+        "timeout_ms": 30_000,
+        "desc": "按需环境快照：设备拍一张环境图并上传（POST /commands/{rid}/image），"
+                "done 回执前必须先传图；图像记录带采集时刻（服务端接收时刻为权威）",
     },
 }
 
@@ -843,9 +852,34 @@ def apply_result(conn, request_id, *, state, boot_id, device_mac=None, progress=
     if dst == DONE:
         fields.update(t_finished_ms=now, error_code=None, error_message=None,
                       progress=100)
-        fields["result_json"] = json.dumps(result, ensure_ascii=False, sort_keys=True) \
-            if result is not None else None
-        detail["result_keys"] = sorted(result) if isinstance(result, dict) else None
+        res = result
+        if row["op"] == "image":
+            # 第7周诚实性铁律：没有图像回执就不得报成功。
+            # done 回执必须发生在图像上传之后，服务端把图像记录与采集时刻
+            # 一并写进结果体——界面显示的是"这张图 + 这个时刻"，旧图不可能
+            # 被标成这次成功（一次请求一个 request_id 一张图）。
+            snap = snapshots.by_request(conn, request_id)
+            if snap is None:
+                raise CommandError(
+                    "op=image 的 done 回执必须先上传图像（POST /api/v1/commands"
+                    "/%s/image），否则无法证明拍到了画面" % request_id,
+                    "image_not_uploaded", 409,
+                )
+            res = dict(res or {})
+            res.update({
+                "image_id": snap["id"],
+                "image_ref": "snap_%d" % snap["id"],
+                "captured_at_ms": snap["t_server_recv_ms"],  # 服务端接收，权威
+                "t_captured_ms": snap["t_captured_ms"],      # 设备声称，参考
+                "source": snap["source"],
+                "sha256": snap["sha256"],
+                "n_bytes": snap["n_bytes"],
+                "width": snap["width"],
+                "height": snap["height"],
+            })
+        fields["result_json"] = json.dumps(res, ensure_ascii=False, sort_keys=True) \
+            if res is not None else None
+        detail["result_keys"] = sorted(res) if isinstance(res, dict) else None
     elif dst == FAILED:
         if not error_code:
             raise CommandError("failed 回执必须带 error_code", "missing_error_code")

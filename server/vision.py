@@ -46,6 +46,10 @@ VISION_REPLAY_SCORE = float(os.environ.get("VISION_REPLAY_SCORE", "0.55") or 0.5
 VISION_REPLAY_LABEL = (os.environ.get("VISION_REPLAY_LABEL", "") or "").strip()
 VISION_REPLAY_MODEL = "replay-rule-1"
 
+# 第9周：主动询问（"画面不可用 → 要重拍吗？"）的冷却时间：用户最近一次选择
+# "忽略"之后，冷却期内不再对任何新画面自动发起询问（拒绝后不反复打扰）。
+VISION_ASK_COOLDOWN_MS = int(os.environ.get("VISION_ASK_COOLDOWN_MS", "300000") or 300000)
+
 _TASK_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
 
 # 保底任务 = 画面可用性/遮挡识别；scene（场景粗分类）为拓展任务。
@@ -100,6 +104,17 @@ CREATE TABLE IF NOT EXISTS corrections (
     t_server_ms  INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_corrections_snapshot ON corrections (snapshot_id);
+
+CREATE TABLE IF NOT EXISTS asks (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    snapshot_id  INTEGER NOT NULL,
+    request_id   TEXT NOT NULL,
+    kind         TEXT NOT NULL DEFAULT 'recapture', -- 目前只有"重拍"一类
+    state        TEXT NOT NULL DEFAULT 'open',      -- open | confirmed | ignored
+    t_server_ms  INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_asks_snapshot_kind ON asks (snapshot_id, kind);
+CREATE INDEX IF NOT EXISTS idx_asks_state ON asks (state, t_server_ms);
 """
 
 
@@ -321,6 +336,13 @@ def add_correction(conn, snapshot, kind="label", value=None, note=None, now=None
          inf["id"] if inf else None, kind, value,
          (note or "").strip()[:200], now),
     )
+    # 第9周：误判能够纠正——用户把画面纠正为"可用"后，未表态的"要重拍吗"询问
+    # 立即作废（superseded），不再提示、不进入冷却（纠正不是"拒绝"，不惩罚冷却）。
+    if value == "usable":
+        conn.execute(
+            "UPDATE asks SET state='superseded' WHERE snapshot_id=? "
+            "AND state='open'", (snapshot["id"],),
+        )
     conn.commit()
     return conn.execute("SELECT * FROM corrections WHERE id=?",
                         (cur.lastrowid,)).fetchone()
@@ -400,3 +422,145 @@ def human_line(inference, corrected=None, captured_ms=None):
     return ("%s 场景粗分类为“%s”（分数 %.2f，未校准）。这只是画面像什么场景的粗略判断，"
             "不代表精确位置，也不构成任何安全结论。"
             % (base, label, score))
+
+
+# ============================================================ 第9周：主动询问
+# 事件触发：画面无法使用（遮挡/模糊/未知/拒识/低分）→ 系统主动问"要重拍吗？"，
+# 并尊重用户选择：确认 → 重拍（image 指令）；忽略 → 冷却期内不再打扰。
+# 反馈优先级与不反复打扰的条件都在 ask_eligibility 里一次说清。
+
+
+def usable(conn, snapshot_id):
+    """画面"可用"判定（界面上该展示的判断）：用户纠正优先于模型推断。
+
+    返回 (bool, why)：集中了"误判能够纠正"的口径——用户纠正为可用，就不再当作
+    不可用反复询问；纠正为不可用，则按不可用对待。
+    """
+    corr = conn.execute(
+        "SELECT value FROM corrections WHERE snapshot_id=?"
+        " ORDER BY t_server_ms DESC, id DESC LIMIT 1", (int(snapshot_id),),
+    ).fetchone()
+    if corr is not None:
+        return corr["value"] == "usable", "corrected:" + corr["value"]
+    inf = get(conn, snapshot_id, "usability")
+    if inf is None:
+        return False, "no_inference"
+    if inf["status"] in ("rejected", "error"):
+        return False, inf["status"]
+    ok = inf["label"] == "usable" and (inf["score"] is None
+                                       or inf["score"] >= VISION_LOW_SCORE)
+    return ok, ("usable" if ok else "not_usable:%s@%.2f"
+                % (inf["label"], inf["score"] or 0))
+
+
+def get_ask(conn, snapshot_id, kind="recapture"):
+    ensure_schema(conn)
+    row = conn.execute(
+        "SELECT * FROM asks WHERE snapshot_id=? AND kind=?",
+        (int(snapshot_id), kind),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def last_ignored_ms(conn, kind="recapture"):
+    """最近一次"忽略"重拍询问的时刻（跨画面：用户说一次"不用"就不该连环追问）。"""
+    row = conn.execute(
+        "SELECT MAX(t_server_ms) AS t FROM asks WHERE kind=? AND state='ignored'",
+        (kind,),
+    ).fetchone()
+    return row["t"] if row and row["t"] is not None else None
+
+
+def ask_eligibility(conn, snapshot, now=None, cooldown_ms=None):
+    """这次是否该主动问"要重拍吗"。条件（含反馈优先级）：
+
+      1. 画面不可用（思考：用户纠正过 → 用纠正后的判定，误判能纠正是第一优先级）；
+      2. 同一画面没被问过（open/confirmed/ignored 都算问过，只问一次）；
+      3. 不在冷却期（最近一次"忽略"之后不问任何新画面，拒绝后不反复打扰）；
+      4. 该设备空闲（没有进行中/待领取的采集或图像指令，不打断任务）。
+
+    返回 (eligible, reason, existing_ask|None)。
+    """
+    now = now_ms() if now is None else now
+    cooldown_ms = VISION_ASK_COOLDOWN_MS if cooldown_ms is None else cooldown_ms
+    ok, why = usable(conn, snapshot["id"])
+    if ok:
+        return False, why, None                      # 画面可用：不需要问
+    ask = get_ask(conn, snapshot["id"])
+    if ask is not None:
+        return False, "already_asked:" + ask["state"], ask
+    last_ign = last_ignored_ms(conn)
+    if last_ign is not None and now - last_ign < cooldown_ms:
+        return False, "cooldown", None
+    busy = conn.execute(
+        "SELECT 1 FROM commands WHERE device_mac=? AND op IN ('capture','image')"
+        " AND state IN ('pending','claimed','running') LIMIT 1",
+        (snapshot["device_mac"],),
+    ).fetchone()
+    if busy:
+        return False, "task_busy", None
+    return True, why, None
+
+
+def open_ask(conn, snapshot, now=None):
+    """按事件触发开一条"重拍询问"（资格不满足则不创建）。返回 (ask, reason)。"""
+    now = now_ms() if now is None else now
+    elig, reason, existing = ask_eligibility(conn, snapshot, now=now)
+    if existing is not None:
+        return existing, "existing:" + existing["state"]
+    if not elig:
+        return None, reason
+    cur = conn.execute(
+        "INSERT INTO asks (snapshot_id, request_id, kind, state, t_server_ms)"
+        " VALUES (?,?,?,?,?)",
+        (snapshot["id"], snapshot["request_id"], "recapture", "open", now),
+    )
+    conn.commit()
+    row = conn.execute("SELECT * FROM asks WHERE id=?", (cur.lastrowid,)).fetchone()
+    return dict(row), "ok"
+
+
+def decide_ask(conn, snapshot, decision, now=None):
+    """用户对询问表态：confirm（确认重拍）/ ignore（忽略，进入冷却）。
+
+    存的是"结果状态"名词：confirmed / ignored（open 之外只有这两个终态）。
+    """
+    now = now_ms() if now is None else now
+    state = {"confirm": "confirmed", "ignore": "ignored"}.get(decision)
+    if state is None:
+        raise VisionError("decision 只能取 confirm / ignore", "bad_decision")
+    ask = get_ask(conn, snapshot["id"])
+    if ask is None:
+        raise VisionError("该画面没有待确认的重拍询问", "ask_not_found", 404)
+    if ask["state"] != "open":
+        raise VisionError("该询问已处理（%s），不能重复表态" % ask["state"],
+                          "ask_not_open", 409)
+    conn.execute("UPDATE asks SET state=?, t_server_ms=? WHERE id=?",
+                 (state, now, ask["id"]))
+    conn.commit()
+    row = conn.execute("SELECT * FROM asks WHERE id=?", (ask["id"],)).fetchone()
+    return dict(row)
+
+
+def pending_asks(conn, limit=20):
+    """还没被用户表态的询问（连快照元数据，供横幅轮询）。"""
+    ensure_schema(conn)
+    rows = conn.execute(
+        """SELECT a.id, a.snapshot_id, a.request_id, a.kind, a.state,
+                  a.t_server_ms, s.t_server_recv_ms AS captured_ms,
+                  s.device_mac, s.source
+           FROM asks a JOIN snapshots s ON s.id = a.snapshot_id
+           WHERE a.state = 'open'
+           ORDER BY a.t_server_ms DESC, a.id DESC LIMIT ?""", (limit,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def _view_ask(a, snapshot=None):
+    out = {"id": a["id"], "snapshot_id": a["snapshot_id"],
+           "request_id": a["request_id"], "kind": a["kind"],
+           "state": a["state"], "t_server_ms": a["t_server_ms"]}
+    if snapshot:
+        out["captured_ms"] = snapshot["t_server_recv_ms"]
+        out["device_mac"] = snapshot["device_mac"]
+    return out

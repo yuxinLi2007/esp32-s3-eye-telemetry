@@ -35,6 +35,7 @@ import httpx
 
 import commands
 import db
+import snapshots
 import task_context
 import vision
 
@@ -83,6 +84,11 @@ RECAPTURE_WORDS = (
 IMAGE_RESULT_WORDS = (
     "识别结果", "识别一下", "识别下", "看到了什么", "画面怎么样", "画面如何",
     "这张图", "遮挡吗", "能不能看清", "能看清吗", "画面识别", "是什么场景",
+)
+# 第9周：对"要重拍吗"的询问回答"忽略/不用"——关闭该询问、进入冷却期。
+# 与取消词（"算了/不要了"）刻意分开：取消停的是任务，忽略停的是"别再问了"。
+ASK_IGNORE_WORDS = (
+    "忽略", "不重拍", "不用重拍", "不需要重拍", "不需要拍了", "别重拍了",
 )
 
 TRUST_TEXT = {
@@ -238,6 +244,11 @@ def parse_intent(text, devices):
     if any(w in t for w in IMAGE_RESULT_WORDS):
         return {"action": "image_result", "device_mac": None, "params": {},
                 "reason": "Inference query — 只读"}
+
+    # 第9周：对"要重拍吗"的回答"忽略/不用"——关询问、进冷却
+    if any(w in t for w in ASK_IGNORE_WORDS):
+        return {"action": "ask_ignore", "device_mac": None, "params": {},
+                "reason": "忽略重拍询问（第9周）"}
 
     try:
         llm = _ask_llm(t)
@@ -479,6 +490,29 @@ def recapture_answer(conn, text, intent):
     return {"intent": intent, "answer": answer, "command": cmd, "error_code": None}
 
 
+def ask_ignore_answer(conn):
+    """第9周：用户对"要重拍吗"回答"忽略/不用"——关闭询问、进入冷却期。
+
+    "拒绝后不反复打扰"的落地：ignored 状态 + VISION_ASK_COOLDOWN_MS 冷却窗口，
+    冷却期内任何新画面都不会再自动发起重拍询问。
+    """
+    rows = vision.pending_asks(conn, limit=5)
+    if not rows:
+        return "当前没有待确认的重拍询问。"
+    a = rows[0]
+    snap = conn.execute("SELECT * FROM snapshots WHERE id=?",
+                        (a["snapshot_id"],)).fetchone()
+    if snap is None:
+        return "那条询问对应的画面已不在（可能已被最少保留清理），无需处理。"
+    try:
+        vision.decide_ask(conn, dict(snap), "ignore")
+    except vision.VisionError as exc:
+        return "处理失败：%s" % exc.message
+    return ("好的，本轮不再打扰：已忽略这次重拍询问，"
+            "冷却期（%d 分钟）内同类画面不会重复询问。"
+            % (vision.VISION_ASK_COOLDOWN_MS // 60000))
+
+
 def status_answer(conn):
     """查询最近一条采集/图像指令的真实状态（只读，不新发指令）。"""
     commands.sweep(conn)   # 先把超期未领/执行超时结算掉，再回答
@@ -503,8 +537,19 @@ def status_answer(conn):
             r = c.get("result") or {}
             if r.get("captured_at_ms"):
                 src = "回放" if r.get("source") == "replay" else "实拍"
-                return ("图像采集完成：服务端 %s 收到画面（%s）。"
+                base = ("图像采集完成：服务端 %s 收到画面（%s）。"
                         % (_fmt_clock(r["captured_at_ms"]), src))
+                # 第9周：画面不可用 → 主动询问"要重拍吗"（反馈优先级与冷却见
+                # vision.ask_eligibility；已有询问时照常提示可表态）
+                if r.get("image_id"):
+                    snap = snapshots.get(conn, r["image_id"])
+                    if snap is not None:
+                        elig, _why, ask = vision.ask_eligibility(conn, snap)
+                        if elig:
+                            return base + " 画面可能不太可用，要重拍一张吗？（说“重拍”或“忽略”）"
+                        if ask is not None and ask["state"] == "open":
+                            return base + " 要重拍一张吗？（说“重拍”或“忽略”）"
+                return base
             return "设备报告图像完成，但服务端没有收到图像。"   # 自查，绝不凭空报成功
         if c["n_samples"] and c["n_samples"] > 0:
             extra = ("，设备自报 %d 条" % c["n_samples_device"]) \
@@ -667,6 +712,9 @@ def _execute(conn, text, intent, devices, ctx, t0):
                                     out["command"].get("t_created_ms") or t0)
             task_context.log_event(ctx_id, "recapture_issued", rid)
         return intent, out["answer"], out["command"], out["error_code"]
+
+    if action == "ask_ignore":
+        return intent, ask_ignore_answer(conn), None, None
 
     return intent, "无法理解这条请求，请换种说法。", None, None
 

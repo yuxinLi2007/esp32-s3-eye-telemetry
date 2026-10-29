@@ -36,6 +36,7 @@ import httpx
 import commands
 import db
 import snapshots
+import sources
 import task_context
 import vision
 
@@ -59,6 +60,14 @@ QUERY_WORDS = (
 STATUS_WORDS = (
     "采集结果", "完成没有", "完成了吗", "好了吗", "成功了吗", "采完了",
     "有没有采到", "采到没有", "采到了吗", "有结果",
+)
+# 第10周：多源状态 —— 各源独立状态（未尝试/失败/成功/陈旧）与数据年龄，只读。
+# 与 STATUS_WORDS 分开：STATUS 问"最近一条采集指令执行得怎样"，
+# 这个问"定位/惯性/网络这些来源现在各是什么情况"。
+SOURCE_STATUS_WORDS = (
+    "源状态", "各源状态", "传感器状态", "多源状态", "定位状态", "网络状态",
+    "数据年龄", "有位置吗", "定位到了吗", "定位到没有", "位置更新了吗",
+    "位置没更新", "在线吗", "定位正常吗",
 )
 # 第6周：用户反悔 / 想停 —— 取消当前任务（含未领取的采集指令）、停止播报、回空闲。
 # "停止采集" 在这里也归取消类：用户主观上是不想要这次采集了，交给取消语义处理。
@@ -239,6 +248,11 @@ def parse_intent(text, devices):
     if any(w in t for w in STATUS_WORDS):
         return {"action": "status", "device_mac": None, "params": {},
                 "reason": "Status query — 只读"}
+
+    # 第10周：多源状态 —— 定位/惯性/网络各源现状，只读，不新发指令
+    if any(w in t for w in SOURCE_STATUS_WORDS):
+        return {"action": "source_status", "device_mac": None, "params": {},
+                "reason": "Multi-source status — 只读（第10周）"}
 
     # 第8周：识别结果 —— 只读最新推理（标签/分数/拒识/来源），不新发指令
     if any(w in t for w in IMAGE_RESULT_WORDS):
@@ -513,6 +527,20 @@ def ask_ignore_answer(conn):
             % (vision.VISION_ASK_COOLDOWN_MS // 60000))
 
 
+def source_status_answer(conn):
+    """第10周：多源状态人话（定位/惯性/网络 → 未尝试/失败/成功/陈旧）。
+
+    只读，不新发指令；口径落在 server/sources.answer（补传按原观测时间、
+    no_fix 不是设备故障、无证据不补造位置）。
+    """
+    row = conn.execute(
+        "SELECT device_mac FROM batches ORDER BY id DESC, rowid DESC LIMIT 1"
+    ).fetchone()
+    if row is None:
+        return "还没有任何设备上报过数据，无从谈起各源状态。"
+    return "多源状态：%s" % sources.answer(conn, row["device_mac"])
+
+
 def status_answer(conn):
     """查询最近一条采集/图像指令的真实状态（只读，不新发指令）。"""
     commands.sweep(conn)   # 先把超期未领/执行超时结算掉，再回答
@@ -679,6 +707,9 @@ def _execute(conn, text, intent, devices, ctx, t0):
 
     if action == "status":
         return intent, status_answer(conn), None, None
+
+    if action == "source_status":
+        return intent, source_status_answer(conn), None, None
 
     if action == "query":
         return intent, query_answer(conn, intent), None, None

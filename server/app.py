@@ -21,6 +21,7 @@ import assistant
 import commands
 import db
 import snapshots
+import sources
 import task_context
 import vision
 import voice
@@ -46,6 +47,7 @@ async def lifespan(_app):
     commands.init_schema(conn)
     snapshots.ensure_schema(conn)
     vision.ensure_schema(conn)
+    sources.ensure_schema(conn)
     conn.close()
     if not INGEST_TOKEN:
         print(
@@ -90,6 +92,19 @@ class Reading(BaseModel):
     spl_db: float | None = None
 
 
+class SourceEventIn(BaseModel):
+    """第10周：一次来源事件（定位/网络），观测时刻与接收时刻分开保存。
+
+    可选、加法字段：老板子/老固件不带上 sources 也完全正常（=未尝试），
+    不会因为缺源而拒绝任何批次。
+    """
+    source: str = Field(pattern="^(gnss|net)$")
+    state: str = Field(pattern="^(ok|no_fix|offline)$")
+    t_obs_ms: int = Field(ge=0)          # 设备观测时刻（补传=原观测时间）
+    raw: dict | None = None              # 原始观测原样保留（如 lat/lon）
+    replay: bool = False                 # 回放数据：明确标注，非真实上报
+
+
 class IngestBatch(BaseModel):
     device_mac: str
     boot_id: str
@@ -103,6 +118,8 @@ class IngestBatch(BaseModel):
     t_device_ntp_ms: int | None = None
     dropped_since_last: int = Field(default=0, ge=0)
     readings: list[Reading] = Field(min_length=1, max_length=MAX_READINGS_PER_BATCH)
+    # 第10周：可选的各来源事件（定位/网络）；不带上 = 该源"未尝试"。
+    sources: list[SourceEventIn] | None = None
 
 
 @app.get("/health")
@@ -158,14 +175,60 @@ def ingest(batch: IngestBatch, request: Request, conn=Depends(get_conn)):
     batch_id = db.insert_batch(conn, meta)
     if rid:
         commands.link_samples(conn, rid, batch_id, len(meta["readings"]))
+    # 第10周：各来源事件（定位/网络）随批次落地，观测时刻与接收时刻分开保存。
+    # 缺失的源不在这里补任何东西——状态页会如实显示"未尝试"。
+    t_recv = meta["t_server_recv_ms"]
+    n_sources = 0
+    for se in batch.sources or []:
+        sources.record(conn, device_mac=meta["device_mac"], boot_id=batch.boot_id,
+                       source=se.source, state=se.state, t_obs_ms=se.t_obs_ms,
+                       t_recv_ms=t_recv, raw=se.raw, replay=se.replay,
+                       batch_id=batch_id)
+        n_sources += 1
     return {
         "ok": True,
         "batch_id": batch_id,
         "request_id": rid,
         "n_readings": len(meta["readings"]),
+        "n_sources": n_sources,
         "dropped_since_last": meta["dropped_since_last"],
         "t_server_recv_ms": meta["t_server_recv_ms"],
         "server_time_ms": int(time.time() * 1000),
+    }
+
+
+# ------------------------------------------------------------ 第10周：多源独立状态
+# 事件源（gnss/net）状态由 source_events 驱动，派生源（imu）由 readings 驱动；
+# 状态四态：未尝试 / 失败 / 成功 / 陈旧，年龄一律按观测时刻算（补传不冒充当前）。
+# 两个端点都只读、匿名可用（与 query 同级）：它们是"状态页"不是"控制面板"。
+@app.get("/api/v1/devices")
+def devices_list(conn=Depends(get_conn)):
+    """已知设备列表（批次 + 来源事件并集），按最近活跃排序 —— 供多源状态页轮询。"""
+    sources.ensure_schema(conn)
+    rows = conn.execute(
+        """SELECT device_mac, MAX(last_recv) AS last_recv_ms FROM (
+               SELECT device_mac, MAX(t_server_recv_ms) AS last_recv FROM batches
+               GROUP BY device_mac
+             UNION ALL
+               SELECT device_mac, MAX(t_recv_ms) AS last_recv FROM source_events
+               GROUP BY device_mac)
+           GROUP BY device_mac ORDER BY last_recv_ms DESC"""
+    ).fetchall()
+    return {"ok": True, "count": len(rows),
+            "devices": [dict(r) for r in rows]}
+
+
+@app.get("/api/v1/devices/{device_mac}/sources")
+def device_sources(device_mac: str, conn=Depends(get_conn)):
+    """某一台设备的多源独立状态（未尝试/失败/成功/陈旧）+ 观测/接收时刻 + 年龄。"""
+    mac = device_mac.strip().upper()
+    states = sources.snapshot(conn, mac)
+    return {
+        "ok": True,
+        "device_mac": mac,
+        "server_time_ms": int(time.time() * 1000),
+        "source_states": states,
+        "answer": sources.answer(conn, mac),   # 与状态页对照的用户提示
     }
 
 

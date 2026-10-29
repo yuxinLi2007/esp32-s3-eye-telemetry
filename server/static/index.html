@@ -99,6 +99,16 @@
 <div class="wrap">
   <section class="cards" id="cards"></section>
 
+  <!-- 第10周：多源独立状态页（观测时刻 vs 接收时刻；未尝试/失败/成功/陈旧）。
+       sources.js 负责渲染与刷新（自带 5s 轮询，不动既有轮询间隔）。 -->
+  <section class="srcwrap" id="src_section">
+    <div class="src-head">多源状态（第10周）
+      <span class="src-sub">未尝试 / 失败 / 成功 / 陈旧 · 年龄按观测时刻计算</span>
+      <button class="btn mini" id="src_refresh" title="手动刷新多源状态">刷新</button>
+    </div>
+    <div id="src_panel">加载中…</div>
+  </section>
+
   <section class="chartbox">
     <canvas id="c_acc"></canvas>
   </section>
@@ -807,5 +817,6 @@ window.DASH = {
 };
 </script>
 <script src="commands.js"></script>
+<script src="sources.js"></script>
 </body>
 </html>

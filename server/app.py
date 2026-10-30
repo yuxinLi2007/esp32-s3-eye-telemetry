@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field
 
 import assistant
 import commands
+import context
 import db
 import snapshots
 import sources
@@ -229,6 +230,41 @@ def device_sources(device_mac: str, conn=Depends(get_conn)):
         "server_time_ms": int(time.time() * 1000),
         "source_states": states,
         "answer": sources.answer(conn, mac),   # 与状态页对照的用户提示
+    }
+
+
+@app.get("/api/v1/context")
+def device_context(device_mac: str | None = None, conn=Depends(get_conn)):
+    """第11周：多源证据 → 三层上下文（原始观测/派生状态/交互决策），只读匿名。
+
+    device_mac 省略时取最近上报的设备的上下文（平台只有一台设备时不用传参）。
+    返回：rule_version / facts（派生状态，带证据来源与更新时间）/ open_questions
+    （待确认信息）/ raw_refs（三层对照用的 L1 索引）/ answer（人话一页）。
+    """
+    if device_mac:
+        mac = device_mac.strip().upper()
+    else:
+        row = conn.execute(
+            "SELECT device_mac FROM batches ORDER BY id DESC, rowid DESC LIMIT 1"
+        ).fetchone()
+        mac = row["device_mac"] if row else None
+    if not mac:
+        return {"ok": True, "device_mac": None,
+                "server_time_ms": int(time.time() * 1000),
+                "rule_version": context.RULE_VERSION,
+                "facts": [], "open_questions": [], "raw_refs": {},
+                "answer": "还没有任何设备上报过数据，无从谈起上下文。"}
+    ctx = context.derive(conn, mac)
+    return {
+        "ok": True,
+        "device_mac": mac,
+        "server_time_ms": int(time.time() * 1000),
+        "answer": context.answer(conn, mac),
+        "rule_version": ctx["rule_version"],
+        "generated_ms": ctx["generated_ms"],
+        "facts": ctx["facts"],
+        "open_questions": ctx["open_questions"],
+        "raw_refs": ctx["raw_refs"],
     }
 
 

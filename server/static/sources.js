@@ -62,6 +62,26 @@
         note.id = 'src_answer_' + d.device_mac.replace(/[^A-Z0-9]/g, '');
         note.textContent = sj.answer || '';
         card.appendChild(note);
+
+        // 第11周：三层上下文（原始观测/派生状态/交互决策）—— 已知事实＋待确认信息
+        const cr = await fetch('/api/v1/context?device_mac=' +
+          encodeURIComponent(d.device_mac), { cache: 'no-store' });
+        if (cr.ok) {
+          const cj = await cr.json();
+          const ctxBlock = document.createElement('div');
+          ctxBlock.className = 'ctx-block';
+          ctxBlock.id = 'ctx_block_' + d.device_mac.replace(/[^A-Z0-9]/g, '');
+          const ctxTitle = document.createElement('div');
+          ctxTitle.className = 'src-mac';
+          ctxTitle.textContent = '上下文解释（第11周）· 规则版本 ' + (cj.rule_version || '—');
+          ctxBlock.appendChild(ctxTitle);
+          const ctxAnswer = document.createElement('div');
+          ctxAnswer.className = 'src-answer';
+          ctxAnswer.id = 'ctx_answer_' + d.device_mac.replace(/[^A-Z0-9]/g, '');
+          ctxAnswer.textContent = cj.answer || '';
+          ctxBlock.appendChild(ctxAnswer);
+          card.appendChild(ctxBlock);
+        }
       }
     } catch (e) {
       PANEL.textContent = '多源状态加载失败：' + (e && e.message || e);

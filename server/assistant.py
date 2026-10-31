@@ -34,6 +34,7 @@ from datetime import datetime
 import httpx
 
 import commands
+import context
 import db
 import snapshots
 import sources
@@ -68,6 +69,13 @@ SOURCE_STATUS_WORDS = (
     "源状态", "各源状态", "传感器状态", "多源状态", "定位状态", "网络状态",
     "数据年龄", "有位置吗", "定位到了吗", "定位到没有", "位置更新了吗",
     "位置没更新", "在线吗", "定位正常吗",
+)
+# 第11周：解释上下文 —— "已知事实＋待确认信息"（三层：原始观测/派生状态/交互决策）。
+# 与 SOURCE_STATUS 不同：那问"各源原始状态"，这个问"综合起来现在什么情况、还要确认什么"。
+CONTEXT_WORDS = (
+    "现在什么情况", "什么情况", "怎么回事", "解释一下", "设备状态",
+    "设备怎么样", "现在怎么样", "现在状态", "环境怎么样", "说说现在",
+    "有什么需要确认", "要确认什么", "现在在哪里", "设备在哪", "怎么了",
 )
 # 第6周：用户反悔 / 想停 —— 取消当前任务（含未领取的采集指令）、停止播报、回空闲。
 # "停止采集" 在这里也归取消类：用户主观上是不想要这次采集了，交给取消语义处理。
@@ -253,6 +261,11 @@ def parse_intent(text, devices):
     if any(w in t for w in SOURCE_STATUS_WORDS):
         return {"action": "source_status", "device_mac": None, "params": {},
                 "reason": "Multi-source status — 只读（第10周）"}
+
+    # 第11周：解释上下文 —— 已知事实＋待确认信息，只读，不新发指令
+    if any(w in t for w in CONTEXT_WORDS):
+        return {"action": "context", "device_mac": None, "params": {},
+                "reason": "Context explain — 只读（第11周）"}
 
     # 第8周：识别结果 —— 只读最新推理（标签/分数/拒识/来源），不新发指令
     if any(w in t for w in IMAGE_RESULT_WORDS):
@@ -541,6 +554,20 @@ def source_status_answer(conn):
     return "多源状态：%s" % sources.answer(conn, row["device_mac"])
 
 
+def context_answer(conn):
+    """第11周：把多源证据组织成"已知事实＋待确认信息"的可解释上下文。
+
+    只读，不新发指令；三层口径（原始观测/派生状态/交互决策）与当堂验证
+    （遮挡≠危险、陈旧≠当前位置、推断与观测明确区分）落在 server/context.answer。
+    """
+    row = conn.execute(
+        "SELECT device_mac FROM batches ORDER BY id DESC, rowid DESC LIMIT 1"
+    ).fetchone()
+    if row is None:
+        return "还没有任何设备上报过数据，无从谈起上下文。"
+    return "设备上下文：%s" % context.answer(conn, row["device_mac"])
+
+
 def status_answer(conn):
     """查询最近一条采集/图像指令的真实状态（只读，不新发指令）。"""
     commands.sweep(conn)   # 先把超期未领/执行超时结算掉，再回答
@@ -710,6 +737,9 @@ def _execute(conn, text, intent, devices, ctx, t0):
 
     if action == "source_status":
         return intent, source_status_answer(conn), None, None
+
+    if action == "context":
+        return intent, context_answer(conn), None, None
 
     if action == "query":
         return intent, query_answer(conn, intent), None, None

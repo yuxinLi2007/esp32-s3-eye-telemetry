@@ -21,6 +21,7 @@ import assistant
 import commands
 import context
 import db
+import remind
 import snapshots
 import sources
 import task_context
@@ -49,6 +50,7 @@ async def lifespan(_app):
     snapshots.ensure_schema(conn)
     vision.ensure_schema(conn)
     sources.ensure_schema(conn)
+    remind.ensure_schema(conn)
     conn.close()
     if not INGEST_TOKEN:
         print(
@@ -376,6 +378,64 @@ def control_state(conn=Depends(get_conn)):
     return Response(content=state, media_type="text/plain")
 
 
+# ============================================================ 第12周：提醒偏好与用户纠错
+# 只有显式、有限的反馈动作（off / on / later / restore），"保存反馈"只调整规则，
+# 绝不等于在线训练或自动学习成功。只读查询匿名可用（与 query 同级）；
+# 写偏好/恢复默认会改变"是否打扰用户"的状态，与 cancel/ask_ignore 同级要求
+# CONTROL_TOKEN。
+
+class ReminderPrefIn(BaseModel):
+    device_mac: str | None = Field(default=None, max_length=32)
+    channel: str = Field(default="vision_ask", pattern="^[a-z_]{1,32}$")
+    action: str = Field(pattern="^(off|on|later|restore)$")
+    note: str | None = Field(default=None, max_length=200)
+
+
+@app.get("/api/v1/reminders/prefs")
+def reminders_prefs(device_mac: str | None = None, conn=Depends(get_conn)):
+    """查看本轮提醒偏好（用户可见）：每个渠道 on/off/snooze + 配置版本 + 人话。"""
+    mac = device_mac.strip().upper() if device_mac else remind._GLOBAL
+    return {"ok": True, "server_time_ms": int(time.time() * 1000),
+            **remind.view(conn, mac)}
+
+
+@app.post("/api/v1/reminders/prefs",
+          dependencies=[Depends(require_control_token)])
+def reminders_prefs_set(payload: ReminderPrefIn, conn=Depends(get_conn)):
+    """设置本轮提醒偏好：off（这次不用提醒）/ on / later（稍后）/ restore（恢复默认）。"""
+    mac = payload.device_mac.strip().upper() if payload.device_mac \
+        else remind._GLOBAL
+    out = remind.apply_pref(conn, mac, payload.channel, payload.action,
+                            note=payload.note, source="api")
+    return {"ok": True, "server_time_ms": int(time.time() * 1000), **out}
+
+
+@app.get("/api/v1/reminders/feedback")
+def reminders_feedback(limit: int = Query(default=50, ge=1, le=200),
+                       conn=Depends(get_conn)):
+    """用户反馈记录（确认/纠正/忽略/稍后/关闭/恢复默认），只读审计。"""
+    rows = remind.list_feedback(conn, limit=limit)
+    return {"ok": True, "count": len(rows),
+            "rule_version": remind.RULE_VERSION,
+            "feedback": rows}
+
+
+@app.get("/api/v1/reminders/events")
+def reminders_events(limit: int = Query(default=50, ge=1, le=200),
+                     conn=Depends(get_conn)):
+    """提醒触发与去重日志：同一事件重放只更新 last_seen，不重复触发（fire_count）。"""
+    rows = remind.list_events(conn, limit=limit)
+    return {"ok": True, "count": len(rows), "events": rows}
+
+
+@app.get("/api/v1/reminders/report")
+def reminders_report(device_mac: str | None = None, conn=Depends(get_conn)):
+    """前后对照（实践2）：偏好变更前/后的提醒触发次数 + 任务结果 + 反馈汇总。"""
+    mac = device_mac.strip().upper() if device_mac else None
+    return {"ok": True, "server_time_ms": int(time.time() * 1000),
+            "report": remind.report(conn, device_mac=mac)}
+
+
 # ============================================================ 第2周：远程采集指令
 #
 # 两类调用方，鉴权口径不同，理由也不同：
@@ -661,8 +721,10 @@ def snapshot_analyze(snapshot_id: int, payload: AnalyzeIn, conn=Depends(get_conn
     inf = vision.analyze_snapshot(conn, snap, task=payload.task or "usability",
                                   force=payload.force)
     out = {"ok": True, "snapshot_id": snapshot_id, "inference": inf}
-    # 第9周事件触发：画面不可用 → 主动询问"要重拍吗"（资格不满足则给原因，不打扰）
-    ask, ask_reason = vision.open_ask(conn, snap)
+    # 第9周事件触发：画面不可用 → 主动询问"要重拍吗"（资格不满足则给原因，不打扰）。
+    # 第12周：触发前先过提醒门（偏好 off / 稍后 / 同一事件重放去重）。
+    # remind.handle_vision_ask 响应形状与原来一致（ask 或 ask_note）。
+    ask, ask_reason = remind.handle_vision_ask(conn, snap)
     if ask is not None:
         out["ask"] = vision._view_ask(ask, snap)
     else:
@@ -684,6 +746,10 @@ def snapshot_ask(snapshot_id: int, payload: AskIn, conn=Depends(get_conn)):
                             detail={"code": "snapshot_not_found",
                                     "message": "图像记录不存在"})
     ask = vision.decide_ask(conn, snap, payload.decision)
+    # 第12周：有限反馈记录（确认/忽略），带规则版本与配置版本供前后对照
+    remind.record_feedback(conn, snap["device_mac"] or remind._GLOBAL,
+                           payload.decision, channel="vision_ask",
+                           round_id="ask:%d" % ask["id"])
     out = {"ok": True, "ask": vision._view_ask(ask, snap)}
     if payload.decision == "confirm":
         if not snap["device_mac"]:
@@ -729,6 +795,11 @@ def snapshot_correct(snapshot_id: int, payload: CorrectionIn, conn=Depends(get_c
                                     "message": "图像记录不存在"})
     row = vision.add_correction(conn, snap, kind=payload.kind,
                                 value=payload.value, note=payload.note)
+    # 第12周：纠正也是有限反馈之一（提醒依据有误 → 纠正后询问作废）
+    remind.record_feedback(conn, snap["device_mac"] or remind._GLOBAL,
+                           "correct", channel="vision_ask",
+                           round_id="snapshot:%d" % snapshot_id,
+                           detail="%s=%s" % (payload.kind, payload.value))
     out = dict(row)
     out["effective"] = vision.effective_label(conn, snapshot_id)[0]
     return {"ok": True, "correction": out}
@@ -819,9 +890,11 @@ def assistant_chat(payload: ChatIn, request: Request, conn=Depends(get_conn)):
         )
     result = assistant.chat(conn, payload.text, context_id=payload.context_id)
     # collect / image / recapture / ask_ignore（改设备行为或改询问状态）与
-    # cancel（改指令状态）都是会改变状态的，同级别鉴权。
+    # cancel（改指令状态）以及 remind_*（改提醒偏好）都是会改变状态的，同级别鉴权。
     if result["intent"]["action"] in ("collect", "cancel", "image",
-                                      "recapture", "ask_ignore"):
+                                      "recapture", "ask_ignore",
+                                      "remind_off", "remind_later",
+                                      "remind_restore"):
         require_control_token(request)
     return {
         "ok": True,

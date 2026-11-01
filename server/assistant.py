@@ -29,6 +29,7 @@ import json
 import os
 import re
 import secrets
+import time
 from datetime import datetime
 
 import httpx
@@ -36,6 +37,7 @@ import httpx
 import commands
 import context
 import db
+import remind
 import snapshots
 import sources
 import task_context
@@ -106,6 +108,23 @@ IMAGE_RESULT_WORDS = (
 # 与取消词（"算了/不要了"）刻意分开：取消停的是任务，忽略停的是"别再问了"。
 ASK_IGNORE_WORDS = (
     "忽略", "不重拍", "不用重拍", "不需要重拍", "不需要拍了", "别重拍了",
+)
+# 第12周：提醒偏好 —— 用户对主动提醒的有限反馈（关闭/稍后/恢复默认/查看）。
+# 与 ASK_IGNORE 分开：忽略停的是"当前这条询问"，关闭停的是"本轮以后的提醒"。
+REMIND_OFF_WORDS = (
+    "这次不用提醒", "不用提醒", "别再提醒", "别提醒了", "先别提醒",
+    "不用再提醒", "不要再提醒", "不提醒了", "不用问了", "别问了",
+)
+REMIND_LATER_WORDS = (
+    "稍后再说", "过会儿再说", "待会再说", "一会儿再说", "晚点再说",
+    "稍后再提醒", "过会儿再提醒",
+)
+REMIND_RESTORE_WORDS = (
+    "恢复默认", "恢复提醒", "继续提醒", "重新提醒", "重新开始提醒",
+    "默认提醒", "恢复通知",
+)
+REMIND_REVIEW_WORDS = (
+    "提醒偏好", "提醒设置", "查看提醒", "查看偏好", "提醒状态", "还提醒吗",
 )
 
 TRUST_TEXT = {
@@ -245,7 +264,9 @@ def _ask_llm(text):
 def parse_intent(text, devices):
     """返回 {action, device_mac, params, reason}。
     action ∈ query / collect / image / recapture / image_result
-             / cancel / clarify / refuse / status。
+             / cancel / clarify / refuse / status / source_status / context
+             / ask_ignore / remind_off / remind_later / remind_restore
+             / remind_review。
     """
     t = (text or "").strip()
     if not t:
@@ -276,6 +297,21 @@ def parse_intent(text, devices):
     if any(w in t for w in ASK_IGNORE_WORDS):
         return {"action": "ask_ignore", "device_mac": None, "params": {},
                 "reason": "忽略重拍询问（第9周）"}
+
+    # 第12周：提醒偏好 —— 先于通用关键字（"恢复提醒"不是查询也不是采集）。
+    # 查看只读放在最前，避免"提醒设置"被下面的字面意图吞掉。
+    if any(w in t for w in REMIND_REVIEW_WORDS):
+        return {"action": "remind_review", "device_mac": None, "params": {},
+                "reason": "查看提醒偏好（第12周，只读）"}
+    if any(w in t for w in REMIND_OFF_WORDS):
+        return {"action": "remind_off", "device_mac": None, "params": {},
+                "reason": "关闭本轮提醒（第12周）"}
+    if any(w in t for w in REMIND_LATER_WORDS):
+        return {"action": "remind_later", "device_mac": None, "params": {},
+                "reason": "稍后提醒（第12周）"}
+    if any(w in t for w in REMIND_RESTORE_WORDS):
+        return {"action": "remind_restore", "device_mac": None, "params": {},
+                "reason": "恢复默认提醒（第12周）"}
 
     try:
         llm = _ask_llm(t)
@@ -535,6 +571,11 @@ def ask_ignore_answer(conn):
         vision.decide_ask(conn, dict(snap), "ignore")
     except vision.VisionError as exc:
         return "处理失败：%s" % exc.message
+    # 第12周：忽略是有限反馈之一，记入反馈记录（带规则版本与配置版本）
+    remind.record_feedback(conn, snap["device_mac"] or remind._GLOBAL,
+                           "ignore", channel="vision_ask",
+                           round_id="ask:%d" % a["id"],
+                           detail="user_text: 忽略")
     return ("好的，本轮不再打扰：已忽略这次重拍询问，"
             "冷却期（%d 分钟）内同类画面不会重复询问。"
             % (vision.VISION_ASK_COOLDOWN_MS // 60000))
@@ -552,6 +593,67 @@ def source_status_answer(conn):
     if row is None:
         return "还没有任何设备上报过数据，无从谈起各源状态。"
     return "多源状态：%s" % sources.answer(conn, row["device_mac"])
+
+
+# ---------------------------------------------------------------- 第12周：提醒偏好
+def _latest_mac(conn):
+    row = conn.execute(
+        "SELECT device_mac FROM batches ORDER BY id DESC, rowid DESC LIMIT 1"
+    ).fetchone()
+    return row["device_mac"] if row else None
+
+
+def remind_off_answer(conn):
+    """用户说"这次不用提醒" → 关闭本轮主动提醒（显式规则，可恢复默认）。
+
+    只按显式规则调整：不动模型、不自动个性化；配置版本 +1，回退记录留档。
+    """
+    mac = _latest_mac(conn) or remind._GLOBAL
+    out = remind.apply_pref(conn, mac, "vision_ask", "off", source="user_text",
+                            note="这次不用提醒")
+    return ("好的，已记住：本轮起不再主动提醒（配置版本 v%d）。"
+            "想恢复就说“恢复默认提醒”。" % out["config_version"])
+
+
+def remind_later_answer(conn):
+    """用户说"稍后再说" → 进入稍后窗口（snooze），窗口内不主动打扰。"""
+    mac = _latest_mac(conn) or remind._GLOBAL
+    out = remind.apply_pref(conn, mac, "vision_ask", "later", source="user_text",
+                            note="稍后再说")
+    return ("好的，稍后 %d 分钟再提醒（配置版本 v%d）。"
+            % (remind.REMIND_LATER_MS // 60000, out["config_version"]))
+
+
+def remind_restore_answer(conn):
+    """用户说"恢复默认提醒" → 配置版本回退：清掉本轮偏好，回到默认规则。"""
+    mac = _latest_mac(conn) or remind._GLOBAL
+    out = remind.apply_pref(conn, mac, "vision_ask", "restore",
+                            source="user_text", note="恢复默认提醒")
+    return ("已恢复默认提醒设置（配置版本 v%d → v%d，回退记录已留档）。"
+            % (out["prev_version"], out["config_version"]))
+
+
+def remind_review_answer(conn):
+    """查看本轮提醒偏好与反馈记录（只读，不改任何状态）。"""
+    mac = _latest_mac(conn) or remind._GLOBAL
+    v = remind.view(conn, mac)
+    p = v["channels"]["vision_ask"]
+    if p["value"] == "snooze" and p["until_ms"]:
+        remain = max(0, p["until_ms"] - int(time.time() * 1000))
+        state = "稍后提醒（剩余 %d 分钟）" % (remain // 60000)
+    else:
+        state = {"on": "按默认规则提醒（开）",
+                 "off": "已关闭（本轮不主动提醒）"}.get(p["value"], p["value"])
+    counts: "dict[str, int]" = {}
+    for r in remind.list_feedback(conn, limit=200):
+        counts[r["verb"]] = counts.get(r["verb"], 0) + 1
+    parts = ("提醒偏好（规则版本 %s，配置版本 v%d）：%s。"
+             % (v["rule_version"], v["config_version"], state))
+    parts += (" 反馈记录：" + "、".join("%s %d 次" % (k, n)
+                                       for k, n in sorted(counts.items()))
+              if counts else " 还没有任何反馈记录。")
+    parts += " 关闭说“这次不用提醒”，恢复说“恢复默认提醒”。"
+    return parts
 
 
 def context_answer(conn):
@@ -776,6 +878,18 @@ def _execute(conn, text, intent, devices, ctx, t0):
 
     if action == "ask_ignore":
         return intent, ask_ignore_answer(conn), None, None
+
+    if action == "remind_off":
+        return intent, remind_off_answer(conn), None, None
+
+    if action == "remind_later":
+        return intent, remind_later_answer(conn), None, None
+
+    if action == "remind_restore":
+        return intent, remind_restore_answer(conn), None, None
+
+    if action == "remind_review":
+        return intent, remind_review_answer(conn), None, None
 
     return intent, "无法理解这条请求，请换种说法。", None, None
 

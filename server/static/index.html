@@ -109,6 +109,16 @@
     <div id="src_panel">加载中…</div>
   </section>
 
+  <!-- 第12周：提醒偏好与纠错闭环（用户可见、可撤回；配置版本可回退）。
+       reminders.js 负责渲染与刷新（自带 5s 轮询，不动既有轮询间隔）。 -->
+  <section class="srcwrap" id="remind_section">
+    <div class="src-head">提醒偏好与纠错（第12周）
+      <span class="src-sub">有限反馈：确认 / 纠正 / 忽略 / 稍后 / 恢复默认 · 不自动个性化</span>
+      <button class="btn mini" id="remind_refresh" title="手动刷新提醒偏好">刷新</button>
+    </div>
+    <div id="remind_panel">加载中…</div>
+  </section>
+
   <section class="chartbox">
     <canvas id="c_acc"></canvas>
   </section>
@@ -818,5 +828,6 @@ window.DASH = {
 </script>
 <script src="commands.js"></script>
 <script src="sources.js"></script>
+<script src="reminders.js"></script>
 </body>
 </html>

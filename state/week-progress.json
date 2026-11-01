@@ -1,11 +1,11 @@
 {
-  "lastCompletedWeek": 11,
+  "lastCompletedWeek": 12,
   "redo": [],
   "inProgress": {
-    "week": 12,
+    "week": 13,
     "redo": false,
-    "branch": "week-12",
-    "pr": 14
+    "branch": "week-13",
+    "pr": null
   },
-  "updatedAt": "2026-11-01T15:47:43.649Z"
+  "updatedAt": "2026-11-01T20:13:45.100Z"
 }
